@@ -7648,6 +7648,11 @@ fn image_agent() -> &'static ureq::Agent {
     AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(10))
+            // Same egress policy the rest of the engine enforces: a page must
+            // not be able to make the renderer fetch loopback/RFC1918/link-local
+            // URLs. Filtering happens after DNS resolution so a public hostname
+            // that resolves inward is caught too.
+            .resolver(crate::net_guard::SsrfGuardResolver)
             // Present the same normal browser identity the engine uses for the
             // document. A bot-identifying UA got image requests filtered by CDNs
             // that gate on User-Agent (Akamai/Cloudflare image endpoints on

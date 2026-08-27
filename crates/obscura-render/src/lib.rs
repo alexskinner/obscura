@@ -94,6 +94,8 @@ mod image_capability_tests {
 }
 
 #[cfg(feature = "paint")]
+mod net_guard;
+#[cfg(feature = "paint")]
 mod paint;
 #[cfg(feature = "paint")]
 pub use paint::{
