@@ -4673,5 +4673,32 @@ fn block_with_only_floats_has_no_auto_height() {
         (height("display:flow-root") - 60.0).abs() < 0.01,
         "flow-root must contain its float: got {}",
         height("display:flow-root")
+/// The initial `font-family` is the UA default, which every major engine
+/// renders and reports as a serif (Chromium 147 reports `Times`). We resolved
+/// an absent `font-family` to the bundled *sans* face while `getComputedStyle`
+/// still reported `Times`, so unstyled text measured ~8% wider than the family
+/// we claimed for it and any shrink-to-fit box built from it disagreed with
+/// Chromium. An explicit `serif` was already correct — only the initial value
+/// was wrong, which is why it survived in pages that set a font anywhere.
+#[test]
+fn initial_font_family_matches_an_explicit_serif() {
+    let html = |css: &str| {
+        format!("<div id=t style='float:left;{css}'>Content library</div>")
+    };
+    let width = |css: &str| {
+        let tree = parse_html(&html(css));
+        let layout = layout_dom(&tree, (1600.0, 1000.0));
+        layout.rects[&tree.get_element_by_id("t").unwrap()].width
+    };
+    let initial = width("");
+    let serif = width("font-family:serif");
+    let sans = width("font-family:sans-serif");
+    assert!(
+        (initial - serif).abs() < 0.5,
+        "the initial font-family must resolve like `serif`: initial={initial}, serif={serif}"
+    );
+    assert!(
+        (sans - serif).abs() > 1.0,
+        "sanity: the sans face must actually differ from serif: sans={sans}, serif={serif}"
     );
 }
