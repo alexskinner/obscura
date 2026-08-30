@@ -4673,6 +4673,9 @@ fn block_with_only_floats_has_no_auto_height() {
         (height("display:flow-root") - 60.0).abs() < 0.01,
         "flow-root must contain its float: got {}",
         height("display:flow-root")
+    );
+}
+
 /// The initial `font-family` is the UA default, which every major engine
 /// renders and reports as a serif (Chromium 147 reports `Times`). We resolved
 /// an absent `font-family` to the bundled *sans* face while `getComputedStyle`
