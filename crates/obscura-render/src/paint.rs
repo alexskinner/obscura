@@ -909,6 +909,28 @@ pub struct PreparedRender {
     layout: crate::DomLayout,
 }
 
+/// Which properties a computed-style walk should actually compute.
+///
+/// The walk emits 114 properties and each one costs a `format!`. Building
+/// all of them to answer `getComputedStyle(el).display` is the single
+/// biggest gap against Chrome on real pages, where framework code reads one
+/// or two properties per element across thousands of elements.
+#[derive(Clone, Copy)]
+enum Want<'a> {
+    All,
+    One(&'a str),
+}
+
+impl Want<'_> {
+    fn wants(self, name: &str) -> bool {
+        match self {
+            Want::All => true,
+            Want::One(wanted) => wanted == name,
+        }
+    }
+}
+
+
 impl PreparedRender {
     pub fn viewport(&self) -> (f32, f32) {
         self.viewport
@@ -1369,9 +1391,45 @@ impl PreparedRender {
         &self,
         id: obscura_dom::tree::NodeId,
     ) -> Option<HashMap<&'static str, String>> {
+        self.computed_style_filtered(id, Want::All)
+    }
+
+    /// One property, without computing the other 113.
+    ///
+    /// `None` means this element has no computed style at all (no layout box);
+    /// a property the walk does not emit yields `None` too, which the caller
+    /// must be able to tell apart from an empty value.
+    pub fn computed_style_property(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        name: &str,
+    ) -> Option<String> {
+        self.computed_style_filtered(id, Want::One(name))?
+            .remove(name)
+    }
+
+    fn computed_style_filtered(
+        &self,
+        id: obscura_dom::tree::NodeId,
+        want: Want<'_>,
+    ) -> Option<HashMap<&'static str, String>> {
         let style = self.layout.styles.get(&id)?;
         let rect = self.layout.rects.get(&id);
         let mut out = HashMap::new();
+        // Every property below is emitted through this, so that asking for one
+        // property computes one property. `getComputedStyle(el).display` used
+        // to build all 114 values -- 82us of `format!` per element -- and
+        // serialise them to 2.7KB of JSON for the caller to parse and throw
+        // away. The value expression sits inside the `if`, so a filtered call
+        // never evaluates it.
+        macro_rules! emit {
+            ($name:expr, $value:expr $(,)?) => {
+                if want.wants($name) {
+                    out.insert($name, $value);
+                }
+            };
+        }
+
 
         let active_webkit_clamp = style.webkit_box_display.is_some()
             && style.webkit_box_orient_vertical
@@ -1405,8 +1463,8 @@ impl PreparedRender {
                 _ => "block",
             }
         };
-        out.insert("display", display.to_string());
-        out.insert(
+        emit!("display", display.to_string());
+        emit!(
             "float",
             match style.float {
                 Some(crate::Float::Left) => "left",
@@ -1434,10 +1492,10 @@ impl PreparedRender {
                         _ => "auto".to_string(),
                     }
                 };
-                out.insert(name, value);
+                emit!(name, value);
             }
         }
-        out.insert(
+        emit!(
             "vertical-align",
             match style.vertical_align {
                 Some(crate::VerticalAlign::Top) => "top",
@@ -1447,7 +1505,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "text-transform",
             match style.text_transform {
                 Some(crate::TextTransform::Uppercase) => "uppercase",
@@ -1457,7 +1515,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "list-style-type",
             match style.list_style {
                 Some(crate::ListStyle::Disc) => "disc",
@@ -1471,7 +1529,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "border-collapse",
             if style.border_collapse == Some(true) {
                 "collapse"
@@ -1480,7 +1538,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "table-layout",
             if style.table_layout_fixed {
                 "fixed"
@@ -1489,7 +1547,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "clear",
             match style.clear {
                 Some(crate::Clear::Left) => "left",
@@ -1499,7 +1557,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "position",
             if style.position_fixed {
                 "fixed"
@@ -1514,13 +1572,13 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "z-index",
             style
                 .z_index
                 .map_or_else(|| "auto".to_string(), |v| v.to_string()),
         );
-        out.insert(
+        emit!(
             "visibility",
             if style.visibility_hidden.unwrap_or(false) {
                 "hidden"
@@ -1529,12 +1587,12 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert("opacity", css_number(style.opacity.unwrap_or(1.0)));
-        out.insert(
+        emit!("opacity", css_number(style.opacity.unwrap_or(1.0)));
+        emit!(
             "background-color",
             css_color(style.background_color.unwrap_or([0, 0, 0, 0])),
         );
-        out.insert(
+        emit!(
             "background-origin",
             match style.background_origin {
                 crate::BackgroundOrigin::BorderBox => "border-box",
@@ -1543,7 +1601,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "background-clip",
             match style.background_clip {
                 crate::BackgroundClip::BorderBox => "border-box",
@@ -1553,9 +1611,9 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
-        out.insert("font-size", css_px(style.font_size.unwrap_or(16.0)));
-        out.insert(
+        emit!("color", css_color(style.color.unwrap_or([0, 0, 0, 255])));
+        emit!("font-size", css_px(style.font_size.unwrap_or(16.0)));
+        emit!(
             "font-weight",
             style
                 .font_weight
@@ -1563,23 +1621,23 @@ impl PreparedRender {
                 .unwrap_or_else(|| "400".to_string()),
         );
         if let Some(family) = &style.font_family {
-            out.insert("font-family", family.clone());
+            emit!("font-family", family.clone());
         }
-        out.insert(
+        emit!(
             "line-height",
             match style.line_height.unwrap_or(crate::LineHeight::Normal) {
                 crate::LineHeight::Normal => "normal".to_string(),
                 _ => css_px(self.layout.text_engine.selected_line_height(style)),
             },
         );
-        out.insert(
+        emit!(
             "letter-spacing",
             match style.letter_spacing.unwrap_or(0.0) {
                 value if value == 0.0 => "normal".to_string(),
                 value => css_px(value),
             },
         );
-        out.insert(
+        emit!(
             "white-space",
             match style.white_space.unwrap_or_default() {
                 crate::WhiteSpace::Normal => "normal",
@@ -1591,7 +1649,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "text-overflow",
             match style.text_overflow {
                 crate::TextOverflow::Clip => "clip",
@@ -1599,13 +1657,13 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "-webkit-line-clamp",
             style
                 .webkit_line_clamp
                 .map_or_else(|| "none".to_string(), |lines| lines.to_string()),
         );
-        out.insert(
+        emit!(
             "-webkit-box-orient",
             if style.webkit_box_orient_vertical {
                 "vertical"
@@ -1620,10 +1678,10 @@ impl PreparedRender {
             crate::OverflowWrap::Anywhere => "anywhere",
         }
         .to_string();
-        out.insert("overflow-wrap", overflow_wrap.clone());
+        emit!("overflow-wrap", overflow_wrap.clone());
         // CSSOM retains the legacy alias as a separately addressable property.
-        out.insert("word-wrap", overflow_wrap);
-        out.insert(
+        emit!("word-wrap", overflow_wrap);
+        emit!(
             "word-break",
             match style.word_break.unwrap_or_default() {
                 crate::WordBreak::Normal => "normal",
@@ -1633,7 +1691,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "text-align",
             match style.text_align {
                 Some(taffy::AlignItems::CENTER) => "center",
@@ -1644,8 +1702,8 @@ impl PreparedRender {
         );
 
         if style.ignores_used_box_sizes() {
-            out.insert("width", dimension_css(style.width, "auto"));
-            out.insert("height", dimension_css(style.height, "auto"));
+            emit!("width", dimension_css(style.width, "auto"));
+            emit!("height", dimension_css(style.height, "auto"));
         } else if let Some(rect) = rect {
             let horizontal_non_content =
                 style.border.left + style.border.right + style.padding.left + style.padding.right;
@@ -1658,20 +1716,20 @@ impl PreparedRender {
                     (rect.height - vertical_non_content).max(0.0),
                 ),
             };
-            out.insert("width", css_px(width));
-            out.insert("height", css_px(height));
+            emit!("width", css_px(width));
+            emit!("height", css_px(height));
         } else {
-            out.insert("width", dimension_css(style.width, "auto"));
-            out.insert("height", dimension_css(style.height, "auto"));
+            emit!("width", dimension_css(style.width, "auto"));
+            emit!("height", dimension_css(style.height, "auto"));
         }
         // `auto` is the initial *specified* value, but it computes to `0px` on
         // everything that is not a flex/grid item, which is what browsers
         // report. Reporting `auto` made a caller unable to do length math.
-        out.insert("min-width", dimension_css(style.min_width, "0px"));
-        out.insert("min-height", dimension_css(style.min_height, "0px"));
-        out.insert("max-width", dimension_css(style.max_width, "none"));
-        out.insert("max-height", dimension_css(style.max_height, "none"));
-        out.insert(
+        emit!("min-width", dimension_css(style.min_width, "0px"));
+        emit!("min-height", dimension_css(style.min_height, "0px"));
+        emit!("max-width", dimension_css(style.max_width, "none"));
+        emit!("max-height", dimension_css(style.max_height, "none"));
+        emit!(
             "box-sizing",
             if style.box_sizing == crate::BoxSizing::BorderBox {
                 "border-box"
@@ -1693,7 +1751,7 @@ impl PreparedRender {
                 "visible"
             }
         };
-        out.insert(
+        emit!(
             "overflow-x",
             overflow_axis(
                 style.overflow_specified_x,
@@ -1702,7 +1760,7 @@ impl PreparedRender {
             )
             .to_string(),
         );
-        out.insert(
+        emit!(
             "overflow-y",
             overflow_axis(
                 style.overflow_specified_y,
@@ -1718,7 +1776,7 @@ impl PreparedRender {
             ("margin-bottom", style.margin.bottom, style.margin_auto[2]),
             ("margin-left", style.margin.left, style.margin_auto[3]),
         ] {
-            out.insert(
+            emit!(
                 name,
                 if auto {
                     "auto".to_string()
@@ -1737,7 +1795,7 @@ impl PreparedRender {
             ("border-bottom-width", style.border.bottom),
             ("border-left-width", style.border.left),
         ] {
-            out.insert(name, css_px(value));
+            emit!(name, css_px(value));
         }
         let current_color = style.color.unwrap_or([0, 0, 0, 255]);
         for (name, color) in [
@@ -1746,7 +1804,7 @@ impl PreparedRender {
             ("border-bottom-color", style.border_model.colors.bottom),
             ("border-left-color", style.border_model.colors.left),
         ] {
-            out.insert(
+            emit!(
                 name,
                 css_color(color.or(style.border_color).unwrap_or(current_color)),
             );
@@ -1758,7 +1816,7 @@ impl PreparedRender {
             ("border-bottom-style", effective_border_styles.bottom),
             ("border-left-style", effective_border_styles.left),
         ] {
-            out.insert(name, line_style.css_name().to_string());
+            emit!(name, line_style.css_name().to_string());
         }
         for (name, radius) in [
             ("border-top-left-radius", style.border_model.radii.top_left),
@@ -1775,25 +1833,25 @@ impl PreparedRender {
                 style.border_model.radii.bottom_left,
             ),
         ] {
-            out.insert(name, corner_radius_css(radius));
+            emit!(name, corner_radius_css(radius));
         }
         // Chromium reports the *specified* width here even when the style is
         // `none` (`outline-width:9px;outline-style:none` computes to `9px`, and
         // an untouched element to the `medium` 3px). Only the used width, which
         // paint and geometry take from `used_width()`, collapses to zero.
-        out.insert("outline-width", css_px(style.outline.specified_width));
-        out.insert("outline-style", style.outline.style.css_name().to_string());
-        out.insert(
+        emit!("outline-width", css_px(style.outline.specified_width));
+        emit!("outline-style", style.outline.style.css_name().to_string());
+        emit!(
             "outline-color",
             css_color(style.outline.color.unwrap_or(current_color)),
         );
-        out.insert("outline-offset", css_px(style.outline.offset));
+        emit!("outline-offset", css_px(style.outline.offset));
 
         // The table approximation sets a column direction and stretch alignment
         // on every table box. Those are our layout stand-in, not values the
         // author wrote, so CSSOM reports the initial values instead.
         let internal_flex_only = style.internal_flex_container;
-        out.insert(
+        emit!(
             "flex-direction",
             match style
                 .flex_direction
@@ -1807,7 +1865,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "flex-wrap",
             match style.flex_wrap.unwrap_or(taffy::FlexWrap::NoWrap) {
                 taffy::FlexWrap::NoWrap => "nowrap",
@@ -1816,42 +1874,42 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "align-items",
             style
                 .align_items
                 .filter(|_| style.align_items_authored || !internal_flex_only)
                 .map_or_else(|| "normal".to_string(), align_items_css),
         );
-        out.insert(
+        emit!(
             "justify-items",
             style
                 .justify_items
                 .map_or_else(|| "normal".to_string(), align_items_css),
         );
-        out.insert(
+        emit!(
             "justify-content",
             style
                 .justify_content
                 .map_or_else(|| "normal".to_string(), align_content_css),
         );
-        out.insert(
+        emit!(
             "align-content",
             style
                 .align_content
                 .map_or_else(|| "normal".to_string(), align_content_css),
         );
-        out.insert(
+        emit!(
             "column-gap",
             style
                 .column_gap
                 .map_or_else(|| "normal".to_string(), css_px),
         );
-        out.insert(
+        emit!(
             "row-gap",
             style.row_gap.map_or_else(|| "normal".to_string(), css_px),
         );
-        out.insert(
+        emit!(
             "grid-auto-flow",
             match style.grid_auto_flow.unwrap_or(taffy::GridAutoFlow::Row) {
                 taffy::GridAutoFlow::Row => "row",
@@ -1862,26 +1920,26 @@ impl PreparedRender {
             .to_string(),
         );
 
-        out.insert(
+        emit!(
             "transform",
             transform_css(style, rect, self.root_font_size, self.viewport),
         );
-        out.insert("transform-origin", transform_origin_css(style, rect));
-        out.insert(
+        emit!("transform-origin", transform_origin_css(style, rect));
+        emit!(
             "translate",
             style.individual_translate.map_or_else(
                 || "none".to_string(),
                 |(x, y)| format!("{} {}", dimension_css(x, "0px"), dimension_css(y, "0px")),
             ),
         );
-        out.insert(
+        emit!(
             "rotate",
             style.individual_rotate.map_or_else(
                 || "none".to_string(),
                 |angle| format!("{}deg", css_number(angle)),
             ),
         );
-        out.insert(
+        emit!(
             "scale",
             style.individual_scale.map_or_else(
                 || "none".to_string(),
@@ -1894,7 +1952,7 @@ impl PreparedRender {
         // Every one of these previously came back as the empty string, which
         // a caller cannot distinguish from "not set" (issue #771).
         // ---------------------------------------------------------------
-        out.insert(
+        emit!(
             "direction",
             match style.direction.unwrap_or(taffy::Direction::Ltr) {
                 taffy::Direction::Rtl => "rtl",
@@ -1902,7 +1960,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "font-style",
             if style.font_style_italic.unwrap_or(false) {
                 "italic"
@@ -1916,10 +1974,10 @@ impl PreparedRender {
         } else {
             "none"
         };
-        out.insert("text-decoration-line", text_decoration_line.to_string());
+        emit!("text-decoration-line", text_decoration_line.to_string());
         // The shorthand serializes its longhands; only the line is modeled, so
         // the other two stay at their initial values.
-        out.insert(
+        emit!(
             "text-decoration",
             if text_decoration_line == "none" {
                 "none solid rgb(0, 0, 0)".to_string()
@@ -1930,11 +1988,11 @@ impl PreparedRender {
                 )
             },
         );
-        out.insert(
+        emit!(
             "text-indent",
             dimension_css(style.text_indent.unwrap_or(crate::Dimension::Px(0.0)), "0px"),
         );
-        out.insert(
+        emit!(
             "border-spacing",
             match style.border_spacing {
                 // Browsers collapse the pair when both axes agree.
@@ -1943,14 +2001,14 @@ impl PreparedRender {
                 None => "0px".to_string(),
             },
         );
-        out.insert(
+        emit!(
             "background-image",
             match &style.background_image {
                 Some(url) => format!("url(\"{url}\")"),
                 None => "none".to_string(),
             },
         );
-        out.insert(
+        emit!(
             "background-size",
             match (&style.background_size_expression, style.background_size_fit) {
                 (Some(expression), _) => expression.clone(),
@@ -1962,7 +2020,7 @@ impl PreparedRender {
                 },
             },
         );
-        out.insert(
+        emit!(
             "background-position",
             format!(
                 "{} {}",
@@ -1970,7 +2028,7 @@ impl PreparedRender {
                 position_axis_css(style.background_position.y)
             ),
         );
-        out.insert(
+        emit!(
             "background-repeat",
             match style.background_repeat.unwrap_or((true, true)) {
                 (true, true) => "repeat",
@@ -1980,7 +2038,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "object-fit",
             match style.object_fit {
                 crate::ObjectFit::Fill => "fill",
@@ -1991,7 +2049,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "object-position",
             format!(
                 "{} {}",
@@ -1999,7 +2057,7 @@ impl PreparedRender {
                 position_axis_css(style.object_position.y)
             ),
         );
-        out.insert(
+        emit!(
             "box-shadow",
             match style.box_shadow {
                 Some(shadow) => {
@@ -2021,15 +2079,15 @@ impl PreparedRender {
         );
         // Both default to `currentColor`, so they follow the element's color
         // rather than a fixed default.
-        out.insert(
+        emit!(
             "text-decoration-color",
             css_color(style.color.unwrap_or([0, 0, 0, 255])),
         );
-        out.insert(
+        emit!(
             "caret-color",
             css_color(style.color.unwrap_or([0, 0, 0, 255])),
         );
-        out.insert(
+        emit!(
             "aspect-ratio",
             match style.aspect_ratio {
                 // An intrinsic ratio is the replaced element's own, not an
@@ -2039,52 +2097,52 @@ impl PreparedRender {
                 None => "auto".to_string(),
             },
         );
-        out.insert(
+        emit!(
             "align-self",
             style
                 .align_self
                 .map_or_else(|| "auto".to_string(), align_items_css),
         );
-        out.insert(
+        emit!(
             "justify-self",
             style
                 .justify_self
                 .map_or_else(|| "auto".to_string(), align_items_css),
         );
-        out.insert("flex-grow", css_number(style.flex_grow.unwrap_or(0.0)));
-        out.insert("flex-shrink", css_number(style.flex_shrink.unwrap_or(1.0)));
-        out.insert("flex-basis", dimension_css(style.flex_basis, "auto"));
-        out.insert("order", style.order.to_string());
-        out.insert(
+        emit!("flex-grow", css_number(style.flex_grow.unwrap_or(0.0)));
+        emit!("flex-shrink", css_number(style.flex_shrink.unwrap_or(1.0)));
+        emit!("flex-basis", dimension_css(style.flex_basis, "auto"));
+        emit!("order", style.order.to_string());
+        emit!(
             "grid-column",
             style
                 .grid_column_raw
                 .clone()
                 .unwrap_or_else(|| "auto".to_string()),
         );
-        out.insert(
+        emit!(
             "grid-row",
             style
                 .grid_row_raw
                 .clone()
                 .unwrap_or_else(|| "auto".to_string()),
         );
-        out.insert(
+        emit!(
             "animation-name",
             style
                 .animation_name
                 .clone()
                 .unwrap_or_else(|| "none".to_string()),
         );
-        out.insert(
+        emit!(
             "animation-duration",
             css_seconds(style.animation_timing.duration_ms),
         );
-        out.insert(
+        emit!(
             "animation-delay",
             css_seconds(style.animation_timing.delay_ms),
         );
-        out.insert(
+        emit!(
             "animation-iteration-count",
             if style.animation_timing.iteration_count.is_infinite() {
                 "infinite".to_string()
@@ -2092,7 +2150,7 @@ impl PreparedRender {
                 css_number(style.animation_timing.iteration_count)
             },
         );
-        out.insert(
+        emit!(
             "animation-direction",
             match style.animation_timing.direction {
                 crate::AnimationDirection::Normal => "normal",
@@ -2102,7 +2160,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "animation-fill-mode",
             match style.animation_timing.fill_mode {
                 crate::AnimationFillMode::None => "none",
@@ -2112,7 +2170,7 @@ impl PreparedRender {
             }
             .to_string(),
         );
-        out.insert(
+        emit!(
             "animation-play-state",
             match style.animation_timing.play_state {
                 crate::AnimationPlayState::Running => "running",
@@ -15984,6 +16042,45 @@ mod tests {
 
         assert_eq!(computed("spaced")["border-spacing"], "2px");
         assert_eq!(computed("link")["text-decoration-line"], "underline");
+    }
+
+    /// The one-property path must be a pure subset of the full walk. If the two
+    /// can disagree, every caller has to know which one it got -- so this
+    /// asserts agreement across EVERY property the full walk emits, on several
+    /// element shapes, rather than spot-checking a few.
+    #[test]
+    fn one_property_agrees_with_the_full_computed_style() {
+        let tree = parse_html(
+            r##"<style>#set{color:#00f;font-style:italic;float:left;width:120px;
+                 background-image:url(a.png);box-shadow:1px 2px 3px 4px #f00}</style>
+               <table id="t"><tr id="tr"><td id="td">c</td></tr></table>
+               <ul><li id="li">z</li></ul>
+               <div id="set">x</div><div id="plain">y</div>
+               <a id="link" href="#">l</a><input id="control">"##,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared =
+            prepare_dom(&tree, (800.0, 600.0), None, &mut resources).expect("prepared render");
+
+        let mut checked = 0;
+        for id in ["t", "tr", "td", "li", "set", "plain", "link", "control"] {
+            let node = tree.get_element_by_id(id).unwrap();
+            let full = prepared.computed_style(node).expect("full");
+            for (name, expected) in &full {
+                assert_eq!(
+                    prepared.computed_style_property(node, name).as_deref(),
+                    Some(expected.as_str()),
+                    "#{id} {name}: one-property path disagrees with the full walk"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 800, "expected to compare hundreds of values, got {checked}");
+
+        // A property the walk never emits is absent, not empty -- a caller has
+        // to be able to fall back to its own defaults.
+        let plain = tree.get_element_by_id("plain").unwrap();
+        assert_eq!(prepared.computed_style_property(plain, "no-such-property"), None);
     }
 
     #[test]

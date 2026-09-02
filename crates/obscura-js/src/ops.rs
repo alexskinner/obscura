@@ -5710,6 +5710,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
+        ops.push(op_computed_style_property());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
         ops.push(op_element_scroll_metrics());
@@ -5972,7 +5973,7 @@ pub(crate) fn document_base_href_memoized(state: &ObscuraState) -> Option<String
 pub(crate) fn ensure_prepared_render(
     state: &mut ObscuraState,
 ) -> Option<&obscura_render::PreparedRender> {
-    let base_url = document_base_url(state);
+    let base_url = document_base_url_memoized(state);
     let viewport = state.viewport;
     let render_media = state.render_media;
     let animation_sample = state.animation_sample;
@@ -6819,6 +6820,40 @@ fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
         object.insert(name, serde_json::Value::String(value));
     }
     serde_json::Value::Object(object).to_string()
+}
+
+/// One property of one element's computed style.
+///
+/// `op_computed_style` computes all 114 properties, serialises them to ~2.7KB
+/// of JSON and hands it to JS to parse. That is the right shape when a caller
+/// enumerates a declaration, and the wrong one for `getComputedStyle(el).display`
+/// -- which is what page and framework code overwhelmingly does, across
+/// thousands of distinct elements.
+///
+/// Returns null when the walk emits no such property, which the caller must be
+/// able to tell apart from a genuinely empty value.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_computed_style_property(
+    state: &OpState,
+    #[string] nid_str: String,
+    #[string] name: String,
+) -> Option<String> {
+    let shared = state.borrow::<SharedState>().clone();
+    let nid: u32 = nid_str.parse().unwrap_or(0);
+    let nid = obscura_dom::tree::NodeId::new(nid);
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    let prepared = ensure_prepared_render(&mut gs)?;
+    // Custom properties live in their own map, keyed by the authored name, so
+    // the property walk cannot find them.
+    if name.starts_with("--") {
+        return prepared
+            .computed_custom_properties(nid)
+            .and_then(|custom| custom.get(name.as_str()).cloned());
+    }
+    prepared.computed_style_property(nid, name.as_str())
 }
 
 /// Use the renderer's declaration parser as the single feature-query source

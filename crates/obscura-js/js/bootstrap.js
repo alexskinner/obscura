@@ -8473,15 +8473,23 @@ globalThis.getComputedStyle = (el) => {
   const cacheable = (typeof el === 'object' && el !== null) || typeof el === 'function';
   let snapshot = cacheable ? _computedStyleSnapshotCache.get(el) : null;
   if (!snapshot) {
-    snapshot = { rendered: null, epoch: -1, names: [] };
+    // `one` memoizes single properties fetched without building the full map.
+    // Cleared with the rest of the snapshot whenever the DOM mutates.
+    snapshot = { rendered: null, epoch: -1, names: [], one: new Map() };
     if (cacheable) _computedStyleSnapshotCache.set(el, snapshot);
   }
+  if (!snapshot.one) snapshot.one = new Map();
   const refreshRendered = () => {
     const hasRunningAnimation = typeof _animationsForTarget === 'function'
       && _animationsForTarget(el).some(animation => animation.playState === 'running');
-    if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation) return;
+    // `snapshot.rendered` is also checked: the single-property path advances
+    // the epoch without building the full map, so an epoch match alone does
+    // not mean the map is present. Without this, the first full enumeration
+    // after any single-property read returned nothing.
+    if (snapshot.epoch === _domMutationEpoch && snapshot.rendered && !hasRunningAnimation) return;
     snapshot.epoch = _domMutationEpoch;
     snapshot.rendered = null;
+    snapshot.one.clear();
     if (typeof Deno.core.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
         const raw = Deno.core.ops.op_computed_style(String(el._nid | 0));
@@ -8568,9 +8576,46 @@ globalThis.getComputedStyle = (el) => {
     'clip-path': 'none', 'scroll-behavior': 'auto', 'touch-action': 'auto',
   };
 
+  // Drop the per-property memo when the document has moved on. Deliberately
+  // does NOT call refreshRendered(): the whole point is to answer without
+  // building the 114-property map.
+  const freshenOneCache = () => {
+    const hasRunningAnimation = typeof _animationsForTarget === 'function'
+      && _animationsForTarget(el).some(animation => animation.playState === 'running');
+    if (snapshot.epoch !== _domMutationEpoch || hasRunningAnimation) {
+      snapshot.epoch = _domMutationEpoch;
+      snapshot.rendered = null;
+      snapshot.names = [];
+      snapshot.one.clear();
+    }
+  };
+
+  // One property, one native call. The renderer computes just that property
+  // instead of all 114 and serialising ~2.7KB of JSON for the caller to parse
+  // and discard -- which was ~160us per distinct element.
+  const renderedProperty = (kebab) => {
+    // Freshness FIRST. Consulting a populated full map before checking the
+    // epoch served a stale value after any mutation that followed an
+    // enumeration -- `freshenOneCache` is what drops that map.
+    freshenOneCache();
+    if (snapshot.rendered) {
+      return Object.prototype.hasOwnProperty.call(snapshot.rendered, kebab)
+        ? snapshot.rendered[kebab] : undefined;
+    }
+    if (snapshot.one.has(kebab)) return snapshot.one.get(kebab);
+    let value;
+    if (typeof Deno.core.ops.op_computed_style_property === 'function' && el?._nid != null) {
+      try {
+        const raw = Deno.core.ops.op_computed_style_property(String(el._nid | 0), kebab);
+        value = raw == null ? undefined : raw;
+      } catch (e) { value = undefined; }
+    }
+    snapshot.one.set(kebab, value);
+    return value;
+  };
+
   const lookup = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
-    refreshRendered();
     let kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
     // CSSOM camelCase vendor properties omit the punctuation from their JS
     // spelling (`webkitLineClamp`) but computed-property names retain it
@@ -8581,8 +8626,8 @@ globalThis.getComputedStyle = (el) => {
     // early ECMAScript). Naive camelCase splitting yields `css-float`, which
     // matches no property, so the getter returned ''.
     if (kebab === 'css-float') kebab = 'float';
-    if (snapshot.rendered && Object.prototype.hasOwnProperty.call(snapshot.rendered, kebab))
-      return snapshot.rendered[kebab];
+    const rendered = renderedProperty(kebab);
+    if (rendered !== undefined) return rendered;
     // Non-render builds and properties outside the renderer snapshot retain
     // the lightweight inline CSSOM behavior.
     const inlineVal = target.getPropertyValue ? target.getPropertyValue(rawProp) : '';
