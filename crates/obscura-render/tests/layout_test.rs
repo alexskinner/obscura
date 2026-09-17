@@ -4706,6 +4706,7 @@ fn initial_font_family_matches_an_explicit_serif() {
     );
 }
 
+#[test]
 fn functional_flex_basis_resolves_against_the_containing_block() {
     // readymembership.com: `.main-nav-holder{flex-basis:calc(100% - 314px)}`.
     // Evaluating the calc() context-free at parse time turned the 100% into
