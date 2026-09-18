@@ -4522,6 +4522,7 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
 
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
+#[test]
 fn overflowing_inline_block_list_wraps_inside_its_container() {
     // Wikipedia `.cslist`: an inline-block <ul> of inline-block <li>s. The
     // shrink-fit `NoWrap` approximation must not let the list run as one
