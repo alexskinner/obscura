@@ -4522,6 +4522,7 @@ fn float_ending_at_rounded_segment_boundary_does_not_panic() {
 
     assert_eq!(place(&mut context, 400.3333, FloatDirection::Left).y, 1859.0);
 }
+#[test]
 fn functional_flex_basis_resolves_against_the_containing_block() {
     // readymembership.com: `.main-nav-holder{flex-basis:calc(100% - 314px)}`.
     // Evaluating the calc() context-free at parse time turned the 100% into
