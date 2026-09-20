@@ -394,7 +394,7 @@ pub async fn handle(
                         if (arguments.length !== 1) return;\
                         try {{\
                             const payload = typeof arg === 'string' ? arg : String(arg);\
-                            Deno.core.ops.op_binding_called('{name}', payload);\
+                            globalThis.__obscura_binding_called('{name}', payload);\
                         }} catch (e) {{ /* swallow: binding must not throw into page */ }}\
                     }};",
                     name = name,

@@ -80,13 +80,13 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 <table>
    <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">
-        <img alt="NodeMaven" src="assets/sponsors/nodemaven2.png" width="180"/>
+      <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank">
+        <img alt="NodeMaven" src="assets/sponsors/nodemaven3.png" width="180"/>
       </a>
     </td>
     <td valign="middle">
-      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
-      <b>Why <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">NodeMaven</a>?</b><br>
+      <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
+      <b>Why <a href="https://go.nodemaven.com/obscurareadmeseptember2026" target="_blank">NodeMaven</a>?</b><br>
       ZIP targeting<br>
       99.9% uptime<br>
       IP filtering: all proxies have fraud score &lt;97%<br>
@@ -192,7 +192,9 @@ usable on common LTS servers with glibc 2.35+.
 ### Docker
 
 ```bash
-docker run -d --name obscura -p 127.0.0.1:9222:9222 h4ckf0r0day/obscura
+docker run -d --name obscura -p 127.0.0.1:9222:9222 \
+  -e OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" \
+  h4ckf0r0day/obscura
 ```
 
 Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage build on `distroless/cc:nonroot` — no shell, no package manager, runs as uid 65532, ~57 MB compressed. A mounted `--storage-dir` must be writable by uid 65532. Publish to host loopback as above; `-p 9222:9222` exposes the port on every interface.

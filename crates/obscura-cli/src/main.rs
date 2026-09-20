@@ -330,8 +330,23 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+const CLI_STACK_BYTES: usize = 512 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("obscura-main".to_string())
+        // V8 derives its stack guard from the current native thread. Deep but
+        // valid hostile documents can otherwise exhaust the platform's small
+        // default stack while the page realm is initialized. This reserves
+        // address space; pages are committed only as the stack is used.
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(run_cli)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("obscura main thread panicked"))?
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
+async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Pin the process timezone before V8/ICU reads it. V8 sources the zone for

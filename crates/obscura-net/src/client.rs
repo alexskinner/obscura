@@ -12,7 +12,7 @@ use reqwest::{Client, Method};
 use tokio::sync::{RwLock, watch};
 use url::Url;
 
-use crate::cookies::CookieJar;
+use crate::cookies::{same_site, CookieJar, SameSiteContext};
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
 fn configured_root_paths() -> Vec<std::path::PathBuf> {
@@ -446,6 +446,23 @@ pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'s
         // the page resource scheduler. Until then, cross-site is the safe
         // conservative value; it never overstates ambient trust.
         "cross-site"
+    }
+}
+
+pub(crate) fn same_site_context(
+    request: &ResourceRequest,
+    target: &Url,
+    method_is_safe: bool,
+) -> SameSiteContext {
+    let Some(initiator) = request.initiator.as_ref() else {
+        return SameSiteContext::SameSite;
+    };
+    if same_site(initiator, target) {
+        SameSiteContext::SameSite
+    } else if request.mode == RequestMode::Navigate && method_is_safe {
+        SameSiteContext::CrossSiteTopLevelSafe
+    } else {
+        SameSiteContext::CrossSite
     }
 }
 
@@ -1288,7 +1305,12 @@ impl ObscuraHttpClient {
         }) {
             return None;
         }
-        if request.sends_credentials_to(url) && !self.cookie_jar.get_cookie_header(url).is_empty() {
+        if request.sends_credentials_to(url)
+            && !self
+                .cookie_jar
+                .get_cookie_header_in_context(url, SameSiteContext::SameSite)
+                .is_empty()
+        {
             return None;
         }
         Some(ResourceCacheKey {
@@ -1579,7 +1601,14 @@ impl ObscuraHttpClient {
             }
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
-                self.cookie_jar.get_cookie_header(&current_url)
+                self.cookie_jar.get_cookie_header_in_context(
+                    &current_url,
+                    same_site_context(
+                        &request,
+                        &current_url,
+                        matches!(method, Method::GET | Method::HEAD),
+                    ),
+                )
             } else {
                 String::new()
             };
@@ -2147,7 +2176,7 @@ mod ssrf_tests {
         assert!(request.contains("sec-fetch-mode: cors\r\n"));
         assert!(request.contains("sec-fetch-dest: font\r\n"));
         assert!(!request.contains("cookie:"));
-        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+        assert_eq!(jar.get_cookie_header_same_site(&target), "seed=1");
     }
 
     // #849 — the OBSCURA_FETCH_MAX_BODY_BYTES override #581 gave fetch()/XHR
@@ -2209,7 +2238,7 @@ mod ssrf_tests {
         assert!(request.contains("sec-fetch-dest: script\r\n"));
         assert!(request.contains(&format!("referer: {}\r\n", importing_module)));
         assert!(!request.contains("cookie:"));
-        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+        assert_eq!(jar.get_cookie_header_same_site(&target), "seed=1");
     }
 
     #[tokio::test]
@@ -2245,7 +2274,7 @@ mod ssrf_tests {
         let second = received.recv().await.unwrap().to_ascii_lowercase();
         assert!(first.contains("cookie: seed=1\r\n"));
         assert!(second.contains("cookie: seed=1\r\n"));
-        let cookies = jar.get_cookie_header(&target);
+        let cookies = jar.get_cookie_header_same_site(&target);
         assert!(cookies.contains("seed=1"));
         assert!(cookies.contains("accepted=1"));
     }

@@ -2566,7 +2566,7 @@ fn cascade_node_style(
     tree: &DomTree,
     id: NodeId,
     sheet: &crate::css::Stylesheet,
-    document_sheet: &crate::css::Stylesheet,
+    _document_sheet: &crate::css::Stylesheet,
     shadow_sheets: &HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>>,
     matcher: &mut obscura_dom::selector::Matcher,
     styles: &mut HashMap<NodeId, crate::LayoutStyle>,
@@ -4348,6 +4348,7 @@ fn collect_shadow_stylesheets(
     viewport: (f32, f32),
     media_type: crate::CssMediaType,
 ) -> HashMap<NodeId, std::sync::Arc<crate::css::Stylesheet>> {
+    let external = tree.external_stylesheets();
     let mut roots = Vec::new();
     let mut stack = vec![tree.document()];
     let mut visited = HashSet::new();
@@ -4365,24 +4366,35 @@ fn collect_shadow_stylesheets(
     roots
         .into_iter()
         .map(|root| {
-            let sources = tree
-                .descendants(root)
-                .into_iter()
-                .filter_map(|node_id| {
-                    let node = tree.get_node(node_id)?;
-                    let element = node.as_element()?;
-                    (element.local.as_ref() == "style"
-                        && node.get_attribute("media").is_none_or(|media| {
-                            media.trim().is_empty()
-                                || crate::css::media_query_applies_for_viewport_and_type(
-                                    media,
-                                    viewport,
-                                    media_type,
-                                )
-                        }))
-                    .then(|| tree.text_content(node_id))
-                })
-                .collect::<Vec<_>>();
+            let mut sources = Vec::new();
+            for node_id in tree.descendants(root) {
+                let Some(node) = tree.get_node(node_id) else {
+                    continue;
+                };
+                let Some(element) = node.as_element() else {
+                    continue;
+                };
+                let media_applies = node.get_attribute("media").is_none_or(|media| {
+                    media.trim().is_empty()
+                        || crate::css::media_query_applies_for_viewport_and_type(
+                            media, viewport, media_type,
+                        )
+                });
+                let linked = element.local.as_ref() == "link"
+                    && node.get_attribute("disabled").is_none()
+                    && node.get_attribute("rel").is_some_and(|rel| {
+                        rel.split_ascii_whitespace()
+                            .any(|part| part.eq_ignore_ascii_case("stylesheet"))
+                    });
+                if media_applies && (linked || element.local.as_ref() == "style") {
+                    if let Some(sheet) = external.get(&node_id) {
+                        sources.extend(sheet.sources.iter().map(ToString::to_string));
+                    }
+                }
+                if media_applies && element.local.as_ref() == "style" {
+                    sources.push(tree.text_content(node_id));
+                }
+            }
             let sheet = crate::css::Stylesheet::parse_for_viewport_and_media(
                 tree,
                 &sources,
@@ -4409,21 +4421,31 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
-    // Collect the text of every <style> block in document order.
+    // Collect inline and host-fetched author sheets in document order. Loaded
+    // cross-origin bytes remain outside the page-visible DOM.
+    let external = tree.external_stylesheets();
     let mut css_sources = Vec::new();
     for nid in tree.descendants(tree.document()) {
         if let Some(node) = tree.get_node(nid) {
             if let Some(elem) = node.as_element() {
-                if elem.local.as_ref() == "style"
-                    && node.get_attribute("media").is_none_or(|media| {
-                        media.trim().is_empty()
-                            || crate::css::media_query_applies_for_viewport_and_type(
-                                media,
-                                viewport,
-                                media_type,
-                            )
-                    })
-                {
+                let media_applies = node.get_attribute("media").is_none_or(|media| {
+                    media.trim().is_empty()
+                        || crate::css::media_query_applies_for_viewport_and_type(
+                            media, viewport, media_type,
+                        )
+                });
+                let linked = elem.local.as_ref() == "link"
+                    && node.get_attribute("disabled").is_none()
+                    && node.get_attribute("rel").is_some_and(|rel| {
+                        rel.split_ascii_whitespace()
+                            .any(|part| part.eq_ignore_ascii_case("stylesheet"))
+                    });
+                if media_applies && (linked || elem.local.as_ref() == "style") {
+                    if let Some(sheet) = external.get(&nid) {
+                        css_sources.extend(sheet.sources.iter().map(ToString::to_string));
+                    }
+                }
+                if media_applies && elem.local.as_ref() == "style" {
                     css_sources.push(tree.text_content(nid));
                 }
             }
@@ -15077,6 +15099,28 @@ mod tests {
         }
         tree.remove(source);
         root
+    }
+
+    #[test]
+    fn host_fetched_stylesheet_cascades_without_a_visible_style_node() {
+        let tree = parse_html(
+            r#"<html><head><link rel="stylesheet" href="https://cdn.test/app.css"></head><body><div id="target"></div></body></html>"#,
+        );
+        let link = tree
+            .query_selector("link")
+            .expect("valid selector")
+            .expect("stylesheet link");
+        assert!(tree.replace_external_stylesheet(
+            link,
+            "#target{width:37px;height:19px}".to_string(),
+            false,
+        ));
+
+        let laid = layout_dom(&tree, (200.0, 100.0));
+        let target = tree.get_element_by_id("target").expect("target");
+        assert_eq!(laid.rects[&target].width, 37.0);
+        assert_eq!(laid.rects[&target].height, 19.0);
+        assert!(tree.query_selector_all("style").unwrap().is_empty());
     }
 
     #[test]

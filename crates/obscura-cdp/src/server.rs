@@ -50,6 +50,121 @@ const SHUTDOWN_DRAIN_MS: u64 = 3_000;
 const CONNECTION_LIMIT_RESPONSE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
     Content-Length: 0\r\nConnection: close\r\n\
     X-Obscura-Reason: max-connections\r\n\r\n";
+
+fn control_token_from_env() -> anyhow::Result<Option<String>> {
+    let token = std::env::var("OBSCURA_CDP_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if token.as_ref().is_some_and(|value| value.len() < 32) {
+        anyhow::bail!("OBSCURA_CDP_TOKEN must be at least 32 bytes");
+    }
+    Ok(token)
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.split("\r\n")
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+}
+
+fn bearer_authorized(head: &str, expected: Option<&str>) -> bool {
+    match expected {
+        None => true,
+        Some(expected) => header_value(head, "authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|provided| constant_time_eq(provided, expected)),
+    }
+}
+
+fn host_matches_bind(host_header: &str, bind_ip: std::net::IpAddr, port: u16) -> bool {
+    if bind_ip.is_unspecified() {
+        return true;
+    }
+    let Ok(url) = url::Url::parse(&format!("http://{host_header}/")) else {
+        return false;
+    };
+    if url.port_or_known_default() != Some(port) {
+        return false;
+    }
+    match (url.host(), bind_ip) {
+        (Some(url::Host::Ipv4(address)), std::net::IpAddr::V4(bind)) => {
+            address == bind || (bind.is_loopback() && address.is_loopback())
+        }
+        (Some(url::Host::Ipv6(address)), std::net::IpAddr::V6(bind)) => {
+            address == bind || (bind.is_loopback() && address.is_loopback())
+        }
+        (Some(url::Host::Ipv4(address)), std::net::IpAddr::V6(bind)) => {
+            bind.is_loopback() && address.is_loopback()
+        }
+        (Some(url::Host::Ipv6(address)), std::net::IpAddr::V4(bind)) => {
+            bind.is_loopback() && address.is_loopback()
+        }
+        (Some(url::Host::Domain(domain)), _) => {
+            bind_ip.is_loopback() && domain.eq_ignore_ascii_case("localhost")
+        }
+        (None, _) => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlRefusal {
+    BrowserOrigin,
+    ForeignHost,
+    Unauthorized,
+    OversizedHead,
+}
+
+fn control_refusal(
+    head: &str,
+    bind_ip: std::net::IpAddr,
+    port: u16,
+    auth_token: Option<&str>,
+) -> Option<ControlRefusal> {
+    if header_value(head, "origin").is_some() {
+        return Some(ControlRefusal::BrowserOrigin);
+    }
+    if !header_value(head, "host").is_some_and(|host| host_matches_bind(host, bind_ip, port)) {
+        return Some(ControlRefusal::ForeignHost);
+    }
+    if !bearer_authorized(head, auth_token) {
+        return Some(ControlRefusal::Unauthorized);
+    }
+    None
+}
+
+fn refuse_control_connection(mut stream: std::net::TcpStream, refusal: ControlRefusal) {
+    use std::io::Write;
+    let (status, reason) = match refusal {
+        ControlRefusal::Unauthorized => ("401 Unauthorized", "authentication required"),
+        ControlRefusal::OversizedHead => (
+            "431 Request Header Fields Too Large",
+            "request head too large",
+        ),
+        ControlRefusal::BrowserOrigin | ControlRefusal::ForeignHost => {
+            ("403 Forbidden", "request refused")
+        }
+    };
+    let body = format!("{{\"error\":\"{reason}\"}}");
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
 use crate::types::CdpRequest;
 
 struct CdpMessage {
@@ -173,6 +288,12 @@ pub async fn start_with_serve_options_and_limit(
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
     let addr = SocketAddr::new(ip, port);
+    let auth_token = control_token_from_env()?;
+    if !ip.is_loopback() && auth_token.is_none() {
+        anyhow::bail!(
+            "refusing to expose CDP without authentication; set OBSCURA_CDP_TOKEN to at least 32 bytes"
+        );
+    }
 
     // Issue #62: the HTTP control plane (/json/version, /json) must remain
     // reachable even while V8 JS evaluation blocks the tokio LocalSet thread.
@@ -196,6 +317,9 @@ pub async fn start_with_serve_options_and_limit(
     );
     if allow_file_access {
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
+    }
+    if auth_token.is_some() {
+        info!("CDP bearer authentication enabled");
     }
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
@@ -226,6 +350,7 @@ pub async fn start_with_serve_options_and_limit(
     // above any real connect rate, so the kernel backlog cannot overflow
     // under a connection burst.
     let accept_flag = shutdown_flag.clone();
+    let accept_auth_token = auth_token.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -281,8 +406,18 @@ pub async fn start_with_serve_options_and_limit(
                     match peek_request_head(&stream) {
                         PeekStatus::NotReady => pending.push((stream, since)),
                         PeekStatus::Closed => {}
+                        PeekStatus::Oversized => {
+                            refuse_control_connection(stream, ControlRefusal::OversizedHead);
+                        }
                         PeekStatus::Head(head) => {
-                            if let Err(e) = accept_dispatch(stream, port, &ws_tx, &head) {
+                            if let Err(e) = accept_dispatch(
+                                stream,
+                                ip,
+                                port,
+                                accept_auth_token.as_deref(),
+                                &ws_tx,
+                                &head,
+                            ) {
                                 if !format!("{}", e).contains("close") {
                                     error!("Accept dispatch error: {}", e);
                                 }
@@ -725,6 +860,9 @@ enum PeekStatus {
     NotReady,
     /// Peer went away without sending a full head.
     Closed,
+    /// The header terminator did not fit in the bounded peek buffer. Refuse it;
+    /// security-sensitive headers could otherwise be hidden beyond the cap.
+    Oversized,
     /// A classifiable request head.
     Head(String),
 }
@@ -747,11 +885,13 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
     if n >= 4 && head[..4] != *b"GET " {
         return PeekStatus::Head(String::from_utf8_lossy(head).into_owned());
     }
-    // A head that overflows the peek buffer is classified with what arrived,
-    // matching the pre-polling behavior for oversized headers.
-    let complete = n == HTTP_PEEK_BUF || head.windows(4).any(|w| w == b"\r\n\r\n");
+    let complete = head.windows(4).any(|w| w == b"\r\n\r\n");
     if !complete {
-        return PeekStatus::NotReady;
+        return if n == HTTP_PEEK_BUF {
+            PeekStatus::Oversized
+        } else {
+            PeekStatus::NotReady
+        };
     }
     PeekStatus::Head(String::from_utf8_lossy(head).into_owned())
 }
@@ -765,10 +905,16 @@ fn peek_request_head(stream: &std::net::TcpStream) -> PeekStatus {
 /// - WebSocket: forward to the LocalSet for CDP processing.
 fn accept_dispatch(
     stream: std::net::TcpStream,
+    bind_ip: std::net::IpAddr,
     port: u16,
+    auth_token: Option<&str>,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
     head: &str,
 ) -> anyhow::Result<()> {
+    if let Some(refusal) = control_refusal(head, bind_ip, port, auth_token) {
+        refuse_control_connection(stream, refusal);
+        return Ok(());
+    }
     let endpoint = if head.contains("/json/version") {
         Some("version")
     } else if head.contains("/json/list") || head.contains("/json\r\n") || head.contains("/json HTTP") {
@@ -1835,14 +1981,62 @@ async fn handle_connection_ws(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
-        websocket_authority,
+        bearer_authorized, control_refusal, handle_fetch_resolution, is_navigate_method,
+        merge_cookie_delta, parse_cdp_headers, websocket_authority, ControlRefusal,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    fn native_head(host: &str) -> String {
+        format!(
+            "GET /devtools/browser HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        )
+    }
+
+    #[test]
+    fn native_loopback_cdp_request_is_allowed() {
+        let head = native_head("127.0.0.1:9222");
+        assert_eq!(
+            control_refusal(&head, "127.0.0.1".parse().unwrap(), 9222, None),
+            None
+        );
+    }
+
+    #[test]
+    fn browser_origin_and_rebound_host_are_refused() {
+        let with_origin = native_head("127.0.0.1:9222").replace(
+            "Upgrade: websocket",
+            "Origin: https://evil.example\r\nUpgrade: websocket",
+        );
+        assert_eq!(
+            control_refusal(&with_origin, "127.0.0.1".parse().unwrap(), 9222, None),
+            Some(ControlRefusal::BrowserOrigin)
+        );
+        assert_eq!(
+            control_refusal(
+                &native_head("rebind.example:9222"),
+                "127.0.0.1".parse().unwrap(),
+                9222,
+                None,
+            ),
+            Some(ControlRefusal::ForeignHost)
+        );
+    }
+
+    #[test]
+    fn configured_cdp_token_is_mandatory() {
+        let token = "01234567890123456789012345678901";
+        let mut head = native_head("127.0.0.1:9222");
+        assert!(!bearer_authorized(&head, Some(token)));
+        head = head.replace(
+            "Upgrade: websocket",
+            &format!("Authorization: Bearer {token}\r\nUpgrade: websocket"),
+        );
+        assert!(bearer_authorized(&head, Some(token)));
+    }
 
     #[test]
     fn discovery_uses_the_client_facing_http_authority() {

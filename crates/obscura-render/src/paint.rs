@@ -4332,8 +4332,22 @@ fn paint_laid_dom_scrolled(
             let bottom = (source_bounds.y + source_bounds.height).ceil();
             let layer_width = (right - left).max(1.0) as u32;
             let layer_height = (bottom - top).max(1.0) as u32;
+            // A near-singular transform can inverse-map the viewport to a layer
+            // far larger than any sane allocation. tiny-skia's Pixmap::new would
+            // try to allocate the buffer and OOM-abort the process, so cap the
+            // dimensions here (same limits as the capture path) and skip that
+            // one element rather than aborting the whole page paint (#1019).
+            if layer_width > MAX_CAPTURE_DIMENSION
+                || layer_height > MAX_CAPTURE_DIMENSION
+                || u64::from(layer_width).saturating_mul(u64::from(layer_height))
+                    > MAX_CAPTURE_PIXELS
+            {
+                continue;
+            }
             let layer_delta = (-left, -top);
-            let layer = Pixmap::new(layer_width, layer_height)?;
+            let Some(layer) = Pixmap::new(layer_width, layer_height) else {
+                continue;
+            };
             let layer = paint_laid_dom_scrolled(
                 tree,
                 viewport,
@@ -11974,6 +11988,25 @@ mod tests {
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    // #1019: a near-singular transform over content far larger than the viewport
+    // makes one element's transform layer unallocatable. It must skip that
+    // element, not abort the whole page paint.
+    #[test]
+    fn oversized_transform_layer_does_not_abort_the_whole_paint() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0;background:white">
+                <div style="transform:rotate(45deg) scale(0.001)">
+                    <div style="position:absolute;width:100000px;height:100000px;background:red"></div>
+                </div>
+            </body></html>"#,
+        );
+        let pixmap = paint_dom(&tree, (100.0, 100.0), None);
+        assert!(
+            pixmap.is_some(),
+            "a pathological transform layer must not abort the entire page paint"
+        );
+    }
 
     #[test]
     fn native_shadow_flat_tree_paints_shadow_and_slotted_content_only() {

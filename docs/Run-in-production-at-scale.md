@@ -9,6 +9,7 @@ docker run -d \
   --name obscura \
   --restart unless-stopped \
   -p 127.0.0.1:9222:9222 \
+  -e OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" \
   -v /srv/obscura/data:/data \
   h4ckf0r0day/obscura \
   serve --host 0.0.0.0 --storage-dir /data --stealth
@@ -44,9 +45,8 @@ required for the published port to work at all. Publish to **host loopback**
 exposes the port on every host interface, and Docker's iptables rules bypass
 most host firewalls.
 
-The CDP control plane has no authentication of its own: anything that can reach
-the port can drive the browser. See [Authentication](#authentication) for the
-controls that actually gate it.
+The container bind requires `OBSCURA_CDP_TOKEN`. Send it as a bearer token from
+the CDP client and still publish the port to host loopback where possible.
 
 ## Systemd
 
@@ -148,24 +148,26 @@ CDP needs WebSocket upgrade and long read timeouts.
 
 ## Authentication
 
-Obscura's CDP server has no built-in auth. Anyone who can reach the port can drive the browser. Options:
+Obscura requires `OBSCURA_CDP_TOKEN` (at least 32 bytes) for every non-loopback
+CDP bind. Pass it in the client's `Authorization` header. Also:
 
 - Bind to `127.0.0.1` and require SSH for access (default).
-- Put it behind a reverse proxy that enforces auth.
+- Put it behind a reverse proxy that enforces an additional auth boundary.
 - Use Docker network isolation.
 
 Never bind `0.0.0.0` on a public IP without one of the above.
 
 ## MCP HTTP transport
 
-`obscura mcp --http` binds `127.0.0.1` by default. To reach it from another container, bind with `--host 0.0.0.0` and set an `Origin` allowlist so a browser page cannot drive it cross-origin:
+`obscura mcp --http` binds `127.0.0.1` by default. A non-loopback bind requires a bearer token. Browser origins are denied by default; set an allowlist only when a browser-based MCP client needs access:
 
 ```bash
+OBSCURA_MCP_TOKEN="$(openssl rand -hex 32)" \
 OBSCURA_MCP_ALLOWED_ORIGINS="https://app.example.com" \
   obscura mcp --http --host 0.0.0.0 --port 3000
 ```
 
-Request bodies are capped at 16 MiB. Like the CDP server it has no built-in auth, so keep it on an internal network or behind an authenticating proxy. See [Use the MCP server](Use-the-MCP-server.md).
+Request bodies and headers, batch size, pending requests, and connections are bounded. Keep the service on an internal network even with authentication. See [Use the MCP server](Use-the-MCP-server.md).
 
 ## Observability
 

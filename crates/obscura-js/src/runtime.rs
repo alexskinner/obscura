@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use deno_core::{JsRuntime, RuntimeOptions};
+use deno_core::{v8, JsRuntime, RuntimeOptions};
 use obscura_dom::{DomTree, NodeId};
 #[cfg(feature = "render")]
 use obscura_net::{RequestCredentials, RequestMode, ResourceRequest};
@@ -58,6 +58,31 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 /// serializing it costs nothing measurable; isolate *execution* stays fully
 /// parallel, each isolate on its own thread with no shared lock.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Enter a tokio runtime context when the caller is not already in one.
+///
+/// deno_core registers each isolate with the tokio handle current at
+/// `JsRuntime::new` time and aborts the process if V8 posts a delayed
+/// foreground task (GC memory reducer, idle tasks) while no handle is
+/// registered. Normal callers (CLI, CDP, MCP) run inside tokio, but plain
+/// `#[test]`s and non-tokio embedders do not, so fall back to a
+/// process-wide single-worker runtime kept alive for the whole process.
+/// The guard must stay in scope across `JsRuntime::new`; the registered
+/// handle outlives it.
+fn enter_tokio_context() -> Option<tokio::runtime::EnterGuard<'static>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return None;
+    }
+    static FALLBACK: std::sync::LazyLock<tokio::runtime::Runtime> =
+        std::sync::LazyLock::new(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_time()
+                .build()
+                .expect("fallback tokio runtime")
+        });
+    Some(FALLBACK.enter())
+}
 
 const DEFAULT_CDP_AWAIT_TIMEOUT_MS: u64 = 30_000;
 const HEAP_LIMIT_RECOVERY_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
@@ -141,6 +166,12 @@ fn with_sync_render_loading_disabled<R>(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AccessibilityStyle {
+    pub display_none: bool,
+    pub visibility_hidden: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     /// True when this object is a value that was thrown or that a promise
@@ -213,7 +244,7 @@ pub struct ObscuraJsRuntime {
 
 /// Renders a caught V8 exception as a message for realm evaluation errors.
 fn exception_text(
-    scope: &mut deno_core::v8::TryCatch<'_, deno_core::v8::HandleScope<'_>>,
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
 ) -> String {
     match scope.exception() {
         Some(exception) => exception.to_rust_string_lossy(scope),
@@ -540,6 +571,10 @@ impl ObscuraJsRuntime {
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
         let (runtime, isolate_handle, heap_limit_state) = {
+            // Keep the guard alive for the whole construction: deno_core
+            // captures the current tokio handle at `JsRuntime::new` time and
+            // aborts if a V8 delayed task is posted without one.
+            let _tokio_guard = enter_tokio_context();
             let _create_guard = ISOLATE_CREATE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -580,7 +615,7 @@ impl ObscuraJsRuntime {
             runtime
                 .execute_script(
                     "<obscura:init>",
-                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0;".to_string(),
+                    "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; if (typeof _installWasmStreamingFallback === 'function') _installWasmStreamingFallback();".to_string(),
                 )
                 .expect("init should not fail");
 
@@ -605,6 +640,8 @@ impl ObscuraJsRuntime {
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
         instance.ops_handoff = instance.take_ops_handoff();
+        #[cfg(test)]
+        instance.expose_ops_for_tests();
 
         // `JsRuntime::new` entered this isolate and rusty_v8 would leave it
         // entered for life. Leave the thread's entry stack empty instead; every
@@ -636,7 +673,7 @@ impl ObscuraJsRuntime {
         let context = {
             let mut entered = self.runtime();
             let isolate = entered.v8_isolate();
-            let scope = &mut deno_core::v8::HandleScope::new(isolate);
+            deno_core::v8::scope!(let scope, isolate);
             let context = deno_core::v8::Context::from_snapshot(
                 scope,
                 1,
@@ -657,20 +694,21 @@ impl ObscuraJsRuntime {
     /// Takes the ops object bootstrap handed out, and removes the handoff from
     /// the global so page script can never reach `Deno.core.ops`.
     ///
-    /// deno_core hides `globalThis.Deno` after setup and bootstrap keeps its
-    /// reference in a private const, so this handoff is the only way for the
-    /// host to reach the bound op functions and pass them to a child realm.
+    /// Bootstrap keeps the core reference in a private const. Once deno_core
+    /// has bound the ops, this removes both public globals before page code can
+    /// run, leaving the handoff as the host's only route to child realms.
     fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
         use deno_core::v8;
 
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Local::new(scope, main);
         let scope = &mut v8::ContextScope::new(scope, context);
 
         let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
+        let deno_key = v8::String::new(scope, "Deno")?;
         let ops_key = v8::String::new(scope, "ops")?;
         let global = context.global(scope);
 
@@ -682,7 +720,30 @@ impl ObscuraJsRuntime {
         }
         let ops = v8::Global::new(scope, ops);
         global.delete(scope, handoff_key.into());
+        global.delete(scope, deno_key.into());
         Some(ops)
+    }
+
+    /// Test-only instrumentation seam for assertions about native-op batching.
+    /// Production builds do not compile this method or publish the op table.
+    #[cfg(test)]
+    fn expose_ops_for_tests(&mut self) {
+        use deno_core::v8;
+
+        let Some(ops) = self.ops_handoff.clone() else {
+            return;
+        };
+        let main = self.runtime().main_context();
+        let mut entered = self.runtime();
+        let isolate = entered.v8_isolate();
+        v8::scope!(let scope, isolate);
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let Some(key) = v8::String::new(scope, "__obscura_test_ops") else {
+            return;
+        };
+        let value = v8::Local::new(scope, ops);
+        let _ = context.global(scope).set(scope, key.into(), value);
     }
 
     /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
@@ -714,7 +775,7 @@ impl ObscuraJsRuntime {
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let main_ctx = v8::Local::new(scope, main);
         let realm_ctx = v8::Local::new(scope, realm);
         // SAFETY: these slots on the main context are `Rc::into_raw` pointers
@@ -740,7 +801,7 @@ impl ObscuraJsRuntime {
         };
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Local::new(scope, realm);
         let scope = &mut v8::ContextScope::new(scope, context);
 
@@ -748,6 +809,9 @@ impl ObscuraJsRuntime {
             return false;
         };
         let Some(ops_key) = v8::String::new(scope, "ops") else {
+            return false;
+        };
+        let Some(deno_key) = v8::String::new(scope, "Deno") else {
             return false;
         };
         let global = context.global(scope);
@@ -787,6 +851,7 @@ impl ObscuraJsRuntime {
         }
         // The child realm must not expose the handoff to frame script either.
         global.delete(scope, handoff_key.into());
+        global.delete(scope, deno_key.into());
         copied > 0
     }
 
@@ -801,19 +866,19 @@ impl ObscuraJsRuntime {
 
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Local::new(scope, realm);
         let scope = &mut v8::ContextScope::new(scope, context);
-        let scope = &mut v8::TryCatch::new(scope);
+        v8::tc_scope!(let tc_scope, scope);
 
-        let code = v8::String::new(scope, source).ok_or("source too large")?;
-        let script = match v8::Script::compile(scope, code, None) {
+        let code = v8::String::new(tc_scope, source).ok_or("source too large")?;
+        let script = match v8::Script::compile(tc_scope, code, None) {
             Some(script) => script,
-            None => return Err(exception_text(scope)),
+            None => return Err(exception_text(tc_scope)),
         };
-        match script.run(scope) {
-            Some(value) => Ok(value.to_rust_string_lossy(scope)),
-            None => Err(exception_text(scope)),
+        match script.run(tc_scope) {
+            Some(value) => Ok(value.to_rust_string_lossy(tc_scope)),
+            None => Err(exception_text(tc_scope)),
         }
     }
 
@@ -843,7 +908,7 @@ impl ObscuraJsRuntime {
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
 
         let main_context = v8::Local::new(scope, main);
         let mut carried = Vec::new();
@@ -928,7 +993,7 @@ impl ObscuraJsRuntime {
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let main = v8::Local::new(scope, main);
         let realm = v8::Local::new(scope, realm);
         let token = main.get_security_token(scope);
@@ -954,7 +1019,7 @@ impl ObscuraJsRuntime {
         let main = self.runtime().main_context();
         let mut entered = self.runtime();
         let isolate = entered.v8_isolate();
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
 
         // Read the frame's globals first, then install them in the page realm.
         // Both contexts belong to this isolate, so the handles stay valid
@@ -3079,9 +3144,13 @@ impl ObscuraJsRuntime {
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
-        let result: Result<(), (String, Option<deno_core::error::JsError>)> = (|| {
+        let result: Result<(), (String, Option<Box<deno_core::error::JsError>>)> = (|| {
             let mut entered = self.runtime();
-            let scope = &mut entered.handle_scope();
+            let context = entered.main_context();
+            let isolate = entered.v8_isolate();
+            v8::scope!(let scope, isolate);
+            let context = v8::Local::new(scope, context);
+            let scope = &mut v8::ContextScope::new(scope, context);
             let source = deno_core::v8::String::new(scope, source)
                 .ok_or_else(|| ("JS error: source allocation failed".to_string(), None))?;
             let name = deno_core::v8::String::new(scope, name)
@@ -3099,16 +3168,16 @@ impl ObscuraJsRuntime {
                 false,
                 None,
             );
-            let scope = &mut deno_core::v8::TryCatch::new(scope);
-            let script = deno_core::v8::Script::compile(scope, source, Some(&origin));
+            v8::tc_scope!(let tc_scope, scope);
+            let script = deno_core::v8::Script::compile(tc_scope, source, Some(&origin));
             let Some(script) = script else {
-                if scope.is_execution_terminating() {
-                    scope.cancel_terminate_execution();
+                if tc_scope.is_execution_terminating() {
+                    tc_scope.cancel_terminate_execution();
                     return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
                 }
-                return match scope.exception() {
+                return match tc_scope.exception() {
                     Some(exception) => {
-                        let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                        let error = deno_core::error::JsError::from_v8_exception(tc_scope, exception);
                         Err((format!("JS error: {error}"), Some(error)))
                     }
                     None => Err((
@@ -3117,14 +3186,14 @@ impl ObscuraJsRuntime {
                     )),
                 };
             };
-            if script.run(scope).is_none() {
-                if scope.is_execution_terminating() {
-                    scope.cancel_terminate_execution();
+            if script.run(tc_scope).is_none() {
+                if tc_scope.is_execution_terminating() {
+                    tc_scope.cancel_terminate_execution();
                     return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
                 }
-                return match scope.exception() {
+                return match tc_scope.exception() {
                     Some(exception) => {
-                        let error = deno_core::error::JsError::from_v8_exception(scope, exception);
+                        let error = deno_core::error::JsError::from_v8_exception(tc_scope, exception);
                         Err((format!("JS error: {error}"), Some(error)))
                     }
                     None => Err((
@@ -3133,6 +3202,10 @@ impl ObscuraJsRuntime {
                     )),
                 };
             }
+            // A browser runs the microtask checkpoint at the end of each task.
+            // queueMicrotask/observer delivery from this script is observable
+            // to the caller (canvas damage, resize/intersection bookkeeping).
+            tc_scope.perform_microtask_checkpoint();
             Ok(())
         })();
         let result = match result {
@@ -3268,6 +3341,26 @@ impl ObscuraJsRuntime {
             .ok()
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
+    }
+
+    /// Whether a parser-blocking script inserted by `document.write()` still
+    /// has fetch or evaluation work outstanding.
+    pub fn has_pending_parser_blocking_scripts(&mut self) -> bool {
+        self.evaluate(
+            "globalThis.__obscura_hasPendingParserBlockingScripts?.() === true",
+        )
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    }
+
+    /// Consume the native signal that the current parser script called
+    /// `document.write()` with a script node.
+    pub fn take_document_write_inserted_script(&self) -> bool {
+        self.state
+            .borrow()
+            .document_write_inserted_script
+            .replace(false)
     }
 
     /// Generation of observable connected-document mutations. This excludes
@@ -3831,6 +3924,29 @@ impl ObscuraJsRuntime {
         state.dom.as_ref().map(f)
     }
 
+    #[cfg(feature = "render")]
+    pub fn accessibility_styles(&self) -> HashMap<NodeId, AccessibilityStyle> {
+        let mut state = self.state.borrow_mut();
+        crate::ops::sample_live_document_animations(&mut state);
+        let Some(prepared) = crate::ops::ensure_prepared_render(&mut state) else {
+            return HashMap::new();
+        };
+        prepared
+            .layout()
+            .styles
+            .iter()
+            .map(|(id, style)| {
+                (
+                    *id,
+                    AccessibilityStyle {
+                        display_none: style.display == obscura_render::Display::None,
+                        visibility_hidden: style.visibility_hidden,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Absolute URLs the page requested via fetch()/XHR, in request order
     /// (issue #301). Backs `--dump assets`.
     pub fn fetched_urls(&self) -> Vec<String> {
@@ -4003,7 +4119,8 @@ impl ObscuraJsRuntime {
         result: deno_core::v8::Global<deno_core::v8::Value>,
     ) -> Result<serde_json::Value, String> {
         let mut entered = self.runtime();
-        let scope = &mut entered.handle_scope();
+        let context = entered.main_context();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
         let local = deno_core::v8::Local::new(scope, result);
 
         if local.is_undefined() || local.is_null() {
@@ -4053,7 +4170,8 @@ impl ObscuraJsRuntime {
         // JSON collapses undefined into null. Classify it before serialization.
         let is_undefined = {
             let mut entered = self.runtime();
-            let scope = &mut entered.handle_scope();
+            let isolate = entered.v8_isolate();
+            deno_core::v8::scope!(let scope, isolate);
             deno_core::v8::Local::new(scope, &result).is_undefined()
         };
         if is_undefined {
@@ -4217,6 +4335,43 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn page_script_cannot_reach_deno_core_or_bootstrap_handoff() {
+        let mut rt = setup_runtime("<html><body><p id='value'>safe</p></body></html>");
+        rt.evaluate("delete globalThis.__obscura_test_ops").unwrap();
+
+        assert_eq!(
+            rt.evaluate("[typeof Deno, typeof __obscuraCore, typeof __obscura_core_handoff]")
+                .unwrap(),
+            serde_json::json!(["undefined", "undefined", "undefined"])
+        );
+        assert_eq!(
+            rt.evaluate("document.getElementById('value').textContent")
+                .unwrap(),
+            serde_json::json!("safe"),
+            "DOM ops must continue to work through the private closure"
+        );
+    }
+
+    // #1013: removeAttribute('id') must update the id_index so getElementById no
+    // longer returns the (still-attached) element.
+    #[test]
+    fn get_element_by_id_reflects_remove_attribute() {
+        let mut rt = setup_runtime("<html><body><div id='test'>x</div></body></html>");
+        assert_eq!(
+            rt.evaluate("document.getElementById('test') !== null").unwrap(),
+            serde_json::json!(true),
+            "the element should be found before its id is removed"
+        );
+        rt.evaluate("document.getElementById('test').removeAttribute('id')")
+            .unwrap();
+        assert_eq!(
+            rt.evaluate("document.getElementById('test') === null").unwrap(),
+            serde_json::json!(true),
+            "getElementById must not return an element whose id was removed"
+        );
     }
 
     #[cfg(feature = "render")]
@@ -4563,8 +4718,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn document_domain_getter_and_valid_relaxation_match_effective_host() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_domain_getter_and_valid_relaxation_match_effective_host() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
@@ -4595,8 +4750,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn document_domain_rejects_unrelated_child_and_public_suffix_hosts() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_domain_rejects_unrelated_child_and_public_suffix_hosts() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
@@ -4629,8 +4784,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn document_domain_detached_and_hostless_setters_throw_security_error() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_domain_detached_and_hostless_setters_throw_security_error() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(
             rt.evaluate(
@@ -5553,8 +5708,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn performance_now_does_not_outrun_elapsed_time() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn performance_now_does_not_outrun_elapsed_time() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let lead = rt
             .evaluate(
@@ -6840,8 +6995,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn explicit_viewport_is_distinct_from_fingerprinted_screen() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_viewport_is_distinct_from_fingerprinted_screen() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
@@ -6859,8 +7014,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn screen_override_is_independent_live_and_preserves_screen_identity() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn screen_override_is_independent_live_and_preserves_screen_identity() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
@@ -6896,8 +7051,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn match_media_evaluates_query_lists_conjunctions_ranges_and_orientation() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn match_media_evaluates_query_lists_conjunctions_ranges_and_orientation() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
@@ -6928,8 +7083,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn match_media_matches_are_live_across_viewport_resizes() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn match_media_matches_are_live_across_viewport_resizes() {
         let dom = parse_html("<html><body></body></html>");
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(dom);
@@ -7086,8 +7241,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn ordinary_inline_keeps_computed_sizes_but_uses_content_geometry() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_inline_keeps_computed_sizes_but_uses_content_geometry() {
         let dom = parse_html(
             r#"<html><head><style>
                 html,body,p { margin:0 }
@@ -7197,8 +7352,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn computed_style_uses_renderer_stylesheet_cascade_and_invalidates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_uses_renderer_stylesheet_cascade_and_invalidates() {
         let dom = parse_html(
             r#"<html><head><style>
                 .base {
@@ -7288,8 +7443,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn webkit_truncation_computed_names_use_native_support_and_vendor_prefixes() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn webkit_truncation_computed_names_use_native_support_and_vendor_prefixes() {
         let dom = parse_html(
             r#"<html><head><style>
               #clamp { display:-webkit-box; -webkit-box-orient:vertical;
@@ -7337,8 +7492,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn computed_typography_uses_resolved_renderer_values() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn computed_typography_uses_resolved_renderer_values() {
         let dom = parse_html(
             r#"<html><head><style>
                 #parent {
@@ -7380,8 +7535,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn computed_style_exposes_cascaded_custom_properties_and_invalidates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn computed_style_exposes_cascaded_custom_properties_and_invalidates() {
         let dom = parse_html(
             r#"<html><head><style>
                 :root { --inherited-space: 17px; --derived-space: var(--inherited-space); }
@@ -7546,14 +7701,26 @@ mod tests {
             rt.evaluate("globalThis.__outerTimerRan").unwrap(),
             serde_json::json!(true),
         );
-        rt.run_autonomous_event_loop_turn().await.unwrap();
-        for _ in 0..5 {
+        let mut ticks = 0.0;
+        for _ in 0..12 {
             rt.run_autonomous_event_loop_turn().await.unwrap();
+            let next = rt
+                .evaluate("globalThis.__zeroIntervalTicks")
+                .unwrap()
+                .as_f64()
+                .unwrap();
+            assert!(
+                next <= ticks + 1.0,
+                "a repeating timer must yield between ticks: {ticks} -> {next}",
+            );
+            ticks = next;
+            if ticks == 6.0 {
+                break;
+            }
         }
         assert_eq!(
-            rt.evaluate("globalThis.__zeroIntervalTicks").unwrap(),
-            serde_json::json!(6.0),
-            "the repeating timer must make one tick of progress per event-loop turn",
+            ticks, 6.0,
+            "V8 maintenance wakes must not starve the repeating timer",
         );
         rt.execute_script("clear-zero-interval", "clearInterval(globalThis.__zeroInterval)")
             .unwrap();
@@ -9215,8 +9382,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn rendered_window_scroll_clamps_and_geometry_is_viewport_relative() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn rendered_window_scroll_clamps_and_geometry_is_viewport_relative() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div id="wide" style="width:600px;height:700px"></div>
@@ -9289,8 +9456,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn nested_scroll_metrics_geometry_pixels_and_relayout_share_one_state() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_scroll_metrics_geometry_pixels_and_relayout_share_one_state() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div id="outer" style="box-sizing:border-box;width:120px;height:100px;
@@ -9412,8 +9579,8 @@ mod tests {
     /// box includes trailing padding. A clip boundary suppresses propagation
     /// only on its clipped axis, and ordinary inline boxes expose zero metrics.
     #[cfg(feature = "render")]
-    #[test]
-    fn element_scroll_metrics_match_chromium_overflow_oracles() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_scroll_metrics_match_chromium_overflow_oracles() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
               <style>
@@ -9474,8 +9641,8 @@ mod tests {
     /// 100.4px area cannot move a 100px scrollport, while 100.6px rounds to a
     /// one-pixel range and assigning `.5` moves geometry and paint by 1px.
     #[cfg(feature = "render")]
-    #[test]
-    fn fractional_scroll_ranges_quantize_geometry_and_pixels_at_one_x() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn fractional_scroll_ranges_quantize_geometry_and_pixels_at_one_x() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
               <div id="low" style="width:100px;height:40px;overflow:auto;position:absolute;top:0">
@@ -9565,8 +9732,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn element_scroll_offsets_follow_chromium_box_and_dom_lifecycles() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_scroll_offsets_follow_chromium_box_and_dom_lifecycles() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
               <div id="first"><div id="scroller" style="width:100px;height:80px;overflow:auto">
@@ -9635,8 +9802,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn fixed_panels_scroll_locally_and_transformed_descendants_remain_supported() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_panels_scroll_locally_and_transformed_descendants_remain_supported() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0;height:1800px">
               <div id="modal" style="position:fixed;left:20px;top:20px;width:140px;height:120px;background:red">
@@ -9703,8 +9870,8 @@ mod tests {
     /// clientHeight; the old synthetic 100x20 fallback collapsed all of their
     /// viewport-relative trigger ranges.
     #[cfg(feature = "render")]
-    #[test]
-    fn rendered_client_metrics_use_the_live_padding_box() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn rendered_client_metrics_use_the_live_padding_box() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div id="tracker"
@@ -9799,8 +9966,8 @@ mod tests {
     /// bounding rect and no client rects for display:none/detached elements;
     /// a laid-out zero-size box still contributes one client rect.
     #[cfg(feature = "render")]
-    #[test]
-    fn rendered_cssom_rects_distinguish_no_box_from_zero_size_box() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn rendered_cssom_rects_distinguish_no_box_from_zero_size_box() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div id="hidden" style="display:none;width:80px;height:40px"></div>
@@ -9888,8 +10055,8 @@ mod tests {
     /// verifies subtree movement, bottom-only sticking, and the containing
     /// block's lower boundary without depending on a live site.
     #[cfg(feature = "render")]
-    #[test]
-    fn root_scroll_sticky_geometry_matches_chromium_constraints() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_scroll_sticky_geometry_matches_chromium_constraints() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div style="height:40px"></div>
@@ -9962,8 +10129,8 @@ mod tests {
     /// the sticky subtree pins at x=20, remains distinct from fixed, then
     /// leaves with its 500px containing block at the right boundary.
     #[cfg(feature = "render")]
-    #[test]
-    fn root_scroll_sticky_supports_the_inline_axis() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_scroll_sticky_supports_the_inline_axis() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div style="box-sizing:border-box;margin-left:40px;width:500px;height:100px;padding:10px;border:4px solid">
@@ -10018,8 +10185,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn prepared_render_shares_resource_geometry_with_cssom_and_screenshots() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_render_shares_resource_geometry_with_cssom_and_screenshots() {
         let dom = parse_html(
             r#"<html style="margin:0"><head>
                 <base href="/assets/">
@@ -10214,8 +10381,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn image_resource_arrival_retains_styles_and_rebuilds_intrinsic_geometry() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_resource_arrival_retains_styles_and_rebuilds_intrinsic_geometry() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <img id="hero" src="http://example.test/late.png" style="display:block">
@@ -10290,8 +10457,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn fixed_image_resource_arrival_repaints_without_rebuilding_geometry() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_image_resource_arrival_repaints_without_rebuilding_geometry() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <img id="hero" src="http://example.test/fixed.png"
@@ -10356,8 +10523,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn fixed_flex_image_resource_arrival_still_rebuilds_geometry() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_flex_image_resource_arrival_still_rebuilds_geometry() {
         let dom = parse_html(
             r#"<html><body><div style="display:flex">
                 <img id="hero" src="http://example.test/flex.png"
@@ -10388,8 +10555,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn fixed_css_content_image_arrival_still_rebuilds_intrinsic_geometry() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_css_content_image_arrival_still_rebuilds_intrinsic_geometry() {
         let dom = parse_html(
             r#"<html><body><img id="hero" src="fallback.png"
                 style="display:block;width:20px;height:10px;content:url('http://example.test/content.png')">
@@ -10419,8 +10586,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn document_region_capture_preserves_live_runtime_state_and_resource_cache() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_region_capture_preserves_live_runtime_state_and_resource_cache() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0;height:260px">
                 <div style="height:120px;background:red"></div>
@@ -10601,8 +10768,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn rendered_layout_cache_is_invalidated_by_style_mutations() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn rendered_layout_cache_is_invalidated_by_style_mutations() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div id="box" style="height:300px;width:40px"></div>
@@ -10641,8 +10808,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn element_text_content_replacement_recomputes_empty_selector() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn element_text_content_replacement_recomputes_empty_selector() {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html(
             r#"<style>#x { width: 10px; height: 5px } #x:empty { width: 30px }</style>
@@ -10665,8 +10832,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn prepared_render_survives_detached_no_op_and_same_viewport_updates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_render_survives_detached_no_op_and_same_viewport_updates() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div id="box" class="box" style="height:30px;width:40px"></div>
@@ -10841,8 +11008,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn forward_animation_samples_retain_static_prepared_render() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_animation_samples_retain_static_prepared_render() {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html(
             r#"<html style="margin:0"><body style="margin:0">
@@ -10880,8 +11047,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn forward_active_animation_sample_updates_geometry_and_paint_from_retained_frame() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_active_animation_sample_updates_geometry_and_paint_from_retained_frame() {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html(
             r#"<html style="margin:0"><head><style>
@@ -11030,8 +11197,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn completed_animation_retains_forward_frame_but_backward_seek_rebuilds() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_animation_retains_forward_frame_but_backward_seek_rebuilds() {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html(
             r#"<html style="margin:0"><head><style>
@@ -11088,8 +11255,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn unsupported_custom_property_animation_does_not_keep_render_damage_active() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsupported_custom_property_animation_does_not_keep_render_damage_active() {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_dom(parse_html(
             r#"<html style="margin:0"><head><style>
@@ -11244,8 +11411,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn cssom_geometry_samples_live_document_time() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn cssom_geometry_samples_live_document_time() {
         let mut rt = animation_epoch_runtime();
         rt.evaluate("var box=document.createElement('div');box.id='box';box.className='anim';document.body.appendChild(box)")
             .unwrap();
@@ -11264,8 +11431,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn fixed_animation_capture_is_invariant_after_geometry_flush() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_animation_capture_is_invariant_after_geometry_flush() {
         let make_runtime = || {
             let mut rt = ObscuraJsRuntime::new();
             rt.set_dom(parse_html(
@@ -11363,8 +11530,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn autocomplete_attribute_retains_prepared_render_until_geometry_flush() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn autocomplete_attribute_retains_prepared_render_until_geometry_flush() {
         let dom = parse_html(
             r#"<html style="margin:0"><head><style>
                 input { display:block; width:40px; height:20px }
@@ -11415,8 +11582,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn namespaced_attribute_mutations_participate_in_id_and_render_invalidation() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn namespaced_attribute_mutations_participate_in_id_and_render_invalidation() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0"><div id="box" class="box" style="height:30px;width:40px"></div></body></html>"#,
         );
@@ -11466,8 +11633,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn stylesheet_index_cache_reuses_sources_but_not_live_cascade_or_viewport() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn stylesheet_index_cache_reuses_sources_but_not_live_cascade_or_viewport() {
         let dom = parse_html(
             r#"<html style="margin:0"><head><style id="sheet">
                 .a { width:40px; height:20px }
@@ -11548,8 +11715,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn connected_tree_mutations_queue_retained_styles_until_geometry_flush() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn connected_tree_mutations_queue_retained_styles_until_geometry_flush() {
         let dom = parse_html(
             r#"<html style="margin:0"><head><style>
                 .item{display:block;width:40px;height:12px}
@@ -11640,8 +11807,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn root_overflow_clip_preserves_cssom_scroll_range() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_overflow_clip_preserves_cssom_scroll_range() {
         let dom = parse_html(
             r#"<html style="margin:0;height:100%;overflow:hidden">
                 <body style="margin:0;height:100%">
@@ -11869,19 +12036,19 @@ mod tests {
                 globalThis.__resizeBulkSizes = [];
                 globalThis.__resizeLegacyGeometryCalls = 0;
                 globalThis.__resizeComputedStyleCalls = 0;
-                const nativeBulk = Deno.core.ops.op_resize_observer_measurements;
-                const nativeGeometry = Deno.core.ops.op_layout_geometry;
-                const nativeComputedStyle = Deno.core.ops.op_computed_style;
-                Deno.core.ops.op_resize_observer_measurements = input => {
+                const nativeBulk = __obscura_test_ops.op_resize_observer_measurements;
+                const nativeGeometry = __obscura_test_ops.op_layout_geometry;
+                const nativeComputedStyle = __obscura_test_ops.op_computed_style;
+                __obscura_test_ops.op_resize_observer_measurements = input => {
                     __resizeBulkCalls++;
                     __resizeBulkSizes.push(JSON.parse(input).length);
                     return nativeBulk(input);
                 };
-                Deno.core.ops.op_layout_geometry = (...args) => {
+                __obscura_test_ops.op_layout_geometry = (...args) => {
                     __resizeLegacyGeometryCalls++;
                     return nativeGeometry(...args);
                 };
-                Deno.core.ops.op_computed_style = (...args) => {
+                __obscura_test_ops.op_computed_style = (...args) => {
                     __resizeComputedStyleCalls++;
                     return nativeComputedStyle(...args);
                 };
@@ -12034,8 +12201,8 @@ mod tests {
             "count-scroll-geometry-reads",
             r#"
                 globalThis.__scrollGeometryReads = 0;
-                globalThis.__nativeLayoutGeometry = Deno.core.ops.op_layout_geometry;
-                Deno.core.ops.op_layout_geometry = (...args) => {
+                globalThis.__nativeLayoutGeometry = __obscura_test_ops.op_layout_geometry;
+                __obscura_test_ops.op_layout_geometry = (...args) => {
                     __scrollGeometryReads++;
                     return __nativeLayoutGeometry(...args);
                 };
@@ -12049,7 +12216,7 @@ mod tests {
             .unwrap();
         rt.execute_script(
             "restore-layout-geometry-op",
-            "Deno.core.ops.op_layout_geometry = __nativeLayoutGeometry;",
+            "__obscura_test_ops.op_layout_geometry = __nativeLayoutGeometry;",
         )
         .unwrap();
         assert_eq!(result, serde_json::json!([50, 0, 1]));
@@ -12236,19 +12403,19 @@ mod tests {
                 globalThis.__intersectionBulkSizes = [];
                 globalThis.__intersectionLegacyGeometryCalls = 0;
                 globalThis.__intersectionComputedStyleCalls = 0;
-                const nativeBulk = Deno.core.ops.op_intersection_observer_measurements;
-                const nativeGeometry = Deno.core.ops.op_layout_geometry;
-                const nativeComputedStyle = Deno.core.ops.op_computed_style;
-                Deno.core.ops.op_intersection_observer_measurements = input => {
+                const nativeBulk = __obscura_test_ops.op_intersection_observer_measurements;
+                const nativeGeometry = __obscura_test_ops.op_layout_geometry;
+                const nativeComputedStyle = __obscura_test_ops.op_computed_style;
+                __obscura_test_ops.op_intersection_observer_measurements = input => {
                     __intersectionBulkCalls++;
                     __intersectionBulkSizes.push(JSON.parse(input).length);
                     return nativeBulk(input);
                 };
-                Deno.core.ops.op_layout_geometry = (...args) => {
+                __obscura_test_ops.op_layout_geometry = (...args) => {
                     __intersectionLegacyGeometryCalls++;
                     return nativeGeometry(...args);
                 };
-                Deno.core.ops.op_computed_style = (...args) => {
+                __obscura_test_ops.op_computed_style = (...args) => {
                     __intersectionComputedStyleCalls++;
                     return nativeComputedStyle(...args);
                 };
@@ -12818,8 +12985,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn scroll_into_view_aligns_the_root_viewport_and_clamps() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn scroll_into_view_aligns_the_root_viewport_and_clamps() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0">
                 <div style="height:300px"></div>
@@ -13165,14 +13332,34 @@ mod tests {
         assert_eq!(result, serde_json::json!([true, true, 1, 1]));
     }
 
-    #[test]
-    fn atob_decodes_large_payload_without_argument_stack_overflow() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn atob_decodes_large_payload_without_argument_stack_overflow() {
         let mut rt = setup_runtime("<html><body></body></html>");
         // 60k four-character groups decode to 180k bytes, comfortably above
         // V8's maximum argument count for a single fromCharCode(...bytes).
         let encoded = "QUFB".repeat(60_000);
         let result = rt.evaluate(&format!("atob('{}').length", encoded)).unwrap();
         assert_eq!(result.as_f64().unwrap() as usize, 180_000);
+    }
+
+    // #996: btoa maps each code unit to one Latin-1 byte and throws for code
+    // points above 0xFF — it must not UTF-8-encode the input.
+    #[test]
+    fn btoa_encodes_latin1_not_utf8() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        // é (U+00E9) is the single byte 0xE9 -> "6Q==", not UTF-8's "w6k=".
+        assert_eq!(rt.evaluate("btoa('é')").unwrap(), serde_json::json!("6Q=="));
+        assert_eq!(
+            rt.evaluate("btoa('hello')").unwrap(),
+            serde_json::json!("aGVsbG8=")
+        );
+        // A code point above 0xFF must throw InvalidCharacterError.
+        let name = rt
+            .evaluate(
+                r#"(() => { try { btoa('\u{1F600}'); return 'no-throw'; } catch (e) { return e.name; } })()"#,
+            )
+            .unwrap();
+        assert_eq!(name, serde_json::json!("InvalidCharacterError"));
     }
 
     #[test]
@@ -13525,8 +13712,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn shadow_adopted_stylesheets_apply_and_sync_the_live_cascade() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn shadow_adopted_stylesheets_apply_and_sync_the_live_cascade() {
         let mut rt = setup_runtime(
             r#"<html style="margin:0"><head>
                 <style>.target { width:11px; height:10px }</style>
@@ -13621,8 +13808,8 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[test]
-    fn canvas_2d_live_backing_paints_immediately_with_scaling_clips_and_effects() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn canvas_2d_live_backing_paints_immediately_with_scaling_clips_and_effects() {
         let dom = parse_html(
             r#"<html style="margin:0"><body style="margin:0;width:64px;height:40px;background:#0000ff">
                 <div style="position:absolute;left:4px;top:4px;width:18px;height:14px;overflow:hidden">
@@ -13827,6 +14014,7 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert!(!rt.has_pending_dynamic_scripts());
         assert!(!rt.has_pending_load_delaying_scripts());
+        assert!(!rt.has_pending_parser_blocking_scripts());
         assert_eq!(rt.next_pending_timeout_delay_ms(), None);
         assert_eq!(
             rt.evaluate("typeof __dynScriptBusy").unwrap(),
@@ -13849,6 +14037,13 @@ mod tests {
         assert_eq!(
             rt.evaluate(
                 "Reflect.ownKeys(globalThis).includes('__obscura_hasPendingLoadDelayingScripts')"
+            )
+            .unwrap(),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            rt.evaluate(
+                "Reflect.ownKeys(globalThis).includes('__obscura_hasPendingParserBlockingScripts')"
             )
             .unwrap(),
             serde_json::json!(false)
@@ -14114,8 +14309,8 @@ mod tests {
     /// Regression for #105: `document.forms` / `images` / `links` must be
     /// live, not hardcoded `[]`. jQuery 1.x's submit-event setup iterates
     /// `document.forms` and crashes when it's empty for pages that have forms.
-    #[test]
-    fn document_forms_images_links_are_live() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_forms_images_links_are_live() {
         let mut rt =
             setup_runtime(r#"<form></form><form></form><img><a href="x">l</a><a>no-href</a>"#);
         assert_eq!(
@@ -16147,8 +16342,8 @@ mod tests {
         assert_eq!(bio, serde_json::json!("old text"));
     }
 
-    #[test]
-    fn test_sequential_runtime_swap() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_sequential_runtime_swap() {
         let mut rt1 = setup_runtime("<html><body><h1>Page1</h1></body></html>");
         let title1 = rt1
             .evaluate("document.querySelector('h1').textContent")
@@ -16466,7 +16661,7 @@ mod tests {
         let url = url::Url::parse("http://example.com/test").unwrap();
         let result = rt.evaluate("document.cookie").unwrap();
         assert!(result.as_str().unwrap().contains("foo=bar"));
-        let header = jar.get_cookie_header(&url);
+        let header = jar.get_cookie_header_same_site(&url);
         assert!(
             header.contains("foo=bar"),
             "cookie should be in jar, got: {}",
@@ -16516,7 +16711,7 @@ mod tests {
             "cookie should be deleted, got: {}",
             result
         );
-        assert!(!jar.get_cookie_header(&url).contains("temp="));
+        assert!(!jar.get_cookie_header_same_site(&url).contains("temp="));
     }
 
     #[test]
@@ -16929,10 +17124,10 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const originalFetchOp = __obscura_test_ops.op_fetch_url;
                 const seen = [];
                 try {
-                    Deno.core.ops.op_fetch_url = (url) => {
+                    __obscura_test_ops.op_fetch_url = (url) => {
                         seen.push(url);
                         return JSON.stringify({ status: 200, headers: {}, body: "{}", url });
                     };
@@ -16943,7 +17138,7 @@ mod tests {
                     await new Promise((r) => setTimeout(r, 0));
                     return seen;
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    __obscura_test_ops.op_fetch_url = originalFetchOp;
                 }
             }"#,
                 None,
@@ -16970,9 +17165,9 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const originalFetchOp = __obscura_test_ops.op_fetch_url;
                 try {
-                    Deno.core.ops.op_fetch_url = (url) => {
+                    __obscura_test_ops.op_fetch_url = (url) => {
                         globalThis.__capturedFetchUrl = url;
                         return JSON.stringify({
                             status: 200,
@@ -16985,7 +17180,7 @@ mod tests {
                     const bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
                     return { url: globalThis.__capturedFetchUrl, bytes };
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    __obscura_test_ops.op_fetch_url = originalFetchOp;
                 }
             }"#,
                 None,
@@ -17014,17 +17209,17 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                const original = Deno.core.ops.op_fetch_url;
+                const original = __obscura_test_ops.op_fetch_url;
                 let captured = null;
                 try {
-                    Deno.core.ops.op_fetch_url = (url, method) => {
+                    __obscura_test_ops.op_fetch_url = (url, method) => {
                         captured = method;
                         return JSON.stringify({ status: 200, headers: {}, body: "ok", url });
                     };
                     await fetch(new URL("/api", document.URL), { method: "delete" });
                     return captured;
                 } finally {
-                    Deno.core.ops.op_fetch_url = original;
+                    __obscura_test_ops.op_fetch_url = original;
                 }
             }"#,
                 None,
@@ -17048,10 +17243,10 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     const calls = [];
                     try {
-                        Deno.core.ops.op_fetch_url =
+                        __obscura_test_ops.op_fetch_url =
                             (url, method, headers, body, origin, mode, credentials) => {
                                 calls.push({ url, credentials });
                                 return JSON.stringify({
@@ -17089,7 +17284,7 @@ mod tests {
 
                         return { calls, invalidFetchRejected };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -17202,10 +17397,10 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     const calls = [];
                     try {
-                        Deno.core.ops.op_fetch_url =
+                        __obscura_test_ops.op_fetch_url =
                             (url, method, headers, body) => {
                                 calls.push({
                                     path: new URL(url).pathname,
@@ -17265,7 +17460,7 @@ mod tests {
 
                         return calls;
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -17296,7 +17491,7 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     const calls = [];
                     const includesBytes = (bytes, needle) => {
                         outer: for (let i = 0; i <= bytes.length - needle.length; i++) {
@@ -17308,7 +17503,7 @@ mod tests {
                         return false;
                     };
                     try {
-                        Deno.core.ops.op_fetch_url =
+                        __obscura_test_ops.op_fetch_url =
                             (url, method, headers, body) => {
                                 const bytes = Array.from(
                                     body instanceof Uint8Array
@@ -17384,7 +17579,7 @@ mod tests {
                             },
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -17842,7 +18037,15 @@ mod tests {
             .call_function_on_for_cdp(
                 r#"async () => {
                     const response = await fetch("/start", { mode: "no-cors" });
-                    return { type: response.type, url: response.url, redirected: response.redirected };
+                    return {
+                        type: response.type,
+                        url: response.url,
+                        redirected: response.redirected,
+                        status: response.status,
+                        body: await response.text(),
+                        bodyIsNull: response.body === null,
+                        headerCount: Array.from(response.headers).length,
+                    };
                 }"#,
                 None,
                 &[],
@@ -17853,7 +18056,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.value.unwrap(),
-            serde_json::json!({ "type": "opaque", "url": "", "redirected": false })
+            serde_json::json!({
+                "type": "opaque",
+                "url": "",
+                "redirected": false,
+                "status": 0,
+                "body": "",
+                "bodyIsNull": true,
+                "headerCount": 0,
+            })
         );
     }
 
@@ -17918,9 +18129,9 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     try {
-                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                        __obscura_test_ops.op_fetch_url = (url) => JSON.stringify({
                             status: 200,
                             headers: { "content-type": "text/css" },
                             body: url.endsWith("/assets/route.css")
@@ -17936,12 +18147,10 @@ mod tests {
                         });
                         document.head.appendChild(link);
                         await loaded;
-                        const style = document.querySelector("style[data-obscura-linked]");
-                        const css = style.textContent;
-                        const afterLink = link.nextSibling === style;
                         const list = document.styleSheets;
                         const sheet = link.sheet;
                         const rules = sheet.cssRules;
+                        const css = Array.from(rules, rule => rule.cssText).join("\n");
                         const cssom = {
                             listed: list.length === 1 && list[0] === sheet,
                             stable: link.sheet === sheet && sheet.cssRules === rules,
@@ -17951,22 +18160,22 @@ mod tests {
                         };
                         link.remove();
                         return {
-                            afterLink,
+                            noSyntheticStyle:
+                                !document.querySelector("style[data-obscura-linked]"),
                             importedBeforeRoute:
-                                css.indexOf("color:red") < css.indexOf("display:grid"),
+                                rules[0].cssText.includes("color")
+                                && rules[1].cssText.includes("display"),
                             importedUrl:
                                 css.includes("http://example.com/assets/theme/grain.png"),
                             routeUrl:
                                 css.includes("http://example.com/img/card.png"),
-                            removedWithLink:
-                                !document.querySelector("style[data-obscura-linked]"),
                             cssom,
                             detachedCssom: sheet.ownerNode === null
                                 && link.sheet === null
                                 && list.length === 0,
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -17980,11 +18189,10 @@ mod tests {
         assert_eq!(
             result.value.unwrap(),
             serde_json::json!({
-                "afterLink": true,
+                "noSyntheticStyle": true,
                 "importedBeforeRoute": true,
                 "importedUrl": true,
                 "routeUrl": true,
-                "removedWithLink": true,
                 "cssom": {
                     "listed": true,
                     "stable": true,
@@ -18003,9 +18211,9 @@ mod tests {
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     try {
-                        Deno.core.ops.op_fetch_url = (url) => JSON.stringify({
+                        __obscura_test_ops.op_fetch_url = (url) => JSON.stringify({
                             status: 401,
                             headers: { "content-type": "application/json" },
                             body: "globalThis.__executedFailedScript = true",
@@ -18023,7 +18231,7 @@ mod tests {
                             executed: globalThis.__executedFailedScript === true,
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -18044,15 +18252,109 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cross_origin_dynamic_script_loads_without_exposing_fetch_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            let body = "globalThis.__crossOriginScriptLoaded = true";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+
+        let page = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let page_address = page.local_addr().unwrap();
+        drop(page);
+        let mut rt = redirect_runtime_for_origin(&format!("http://{page_address}"));
+        let result = rt
+            .call_function_on_for_cdp(
+                &format!(
+                    r#"async () => {{
+                        const script = document.createElement("script");
+                        script.src = "http://{address}/script.js";
+                        const outcome = await new Promise(resolve => {{
+                            script.onload = () => resolve("load");
+                            script.onerror = () => resolve("error");
+                            document.head.appendChild(script);
+                        }});
+                        return {{ outcome, loaded: globalThis.__crossOriginScriptLoaded === true }};
+                    }}"#
+                ),
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({ "outcome": "load", "loaded": true })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_origin_follows_the_final_redirect_url() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
+                    try {
+                        __obscura_test_ops.op_fetch_url = async () => JSON.stringify({
+                            status: 200,
+                            headers: { "content-type": "text/html" },
+                            body: "<!doctype html><title>secret</title>",
+                            url: "https://cross-origin.example/secret",
+                            redirected: true,
+                        });
+                        const frame = document.createElement("iframe");
+                        const loaded = new Promise(resolve => frame.onload = resolve);
+                        frame.src = "/same-origin-start";
+                        document.body.appendChild(frame);
+                        await loaded;
+                        return {
+                            readable: frame.contentDocument !== null,
+                            loadedUrl: frame._iframeLoadedUrl,
+                        };
+                    } finally {
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "readable": false,
+                "loadedUrl": "https://cross-origin.example/secret",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dynamic_classic_scripts_are_async_by_default_but_honor_async_false_order() {
         let mut rt = setup_runtime("<html><head></head><body></body></html>");
         let result = rt
             .call_function_on_for_cdp(
                 r#"async () => {
-                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const originalFetchOp = __obscura_test_ops.op_fetch_url;
                     const runPair = async (explicitlyInOrder) => {
                         globalThis.__dynamicOrder = [];
-                        Deno.core.ops.op_fetch_url = (url) => new Promise(resolve => {
+                        __obscura_test_ops.op_fetch_url = (url) => new Promise(resolve => {
                             const slow = url.includes("slow");
                             setTimeout(() => resolve(JSON.stringify({
                                 status: 200,
@@ -18080,7 +18382,7 @@ mod tests {
                             pending: globalThis.__obscura_hasPendingDynamicScripts(),
                         };
                     } finally {
-                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                        __obscura_test_ops.op_fetch_url = originalFetchOp;
                     }
                 }"#,
                 None,
@@ -18835,8 +19137,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn heap_limit_terminates_script_and_runtime_recovers() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn heap_limit_terminates_script_and_runtime_recovers() {
         crate::v8_flags::set_v8_flags("--max-old-space-size=32 --max-semi-space-size=1");
         let mut rt = ObscuraJsRuntime::new();
 
@@ -19215,8 +19517,8 @@ mod tests {
         assert_eq!(request_thread.join().unwrap(), "/scoped.js");
     }
 
-    #[test]
-    fn timed_out_classic_script_leaves_runtime_reusable() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_classic_script_leaves_runtime_reusable() {
         let mut rt = ObscuraJsRuntime::new();
         rt.execute_script_with_timeout(
             "https://example.test/hang.js",
@@ -19800,9 +20102,9 @@ mod tests {
                 document.body.appendChild(parsed.querySelector("script"));
 
                 let externalFetches = 0;
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const originalFetchOp = __obscura_test_ops.op_fetch_url;
                 try {
-                    Deno.core.ops.op_fetch_url = () => {
+                    __obscura_test_ops.op_fetch_url = () => {
                         externalFetches++;
                         return JSON.stringify({
                             status: 200,
@@ -19815,7 +20117,7 @@ mod tests {
                     external.innerHTML = "<script src=/inert.js><\/script>";
                     document.head.appendChild(external.firstChild);
                 } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                    __obscura_test_ops.op_fetch_url = originalFetchOp;
                 }
                 return [globalThis.__fragmentScriptRuns, externalFetches];
                 "#,
@@ -20049,6 +20351,97 @@ mod tests {
             result,
             serde_json::json!(r#"{"wrap":true,"inner":true,"nested":true}"#)
         );
+    }
+
+    // WebIDL puts interface operations on the interface prototype with
+    // enumerable: true, so in a browser Object.keys(MutationObserver.prototype)
+    // is ['observe', 'disconnect', 'takeRecords']. ES class methods are
+    // enumerable: false. Internals must stay hidden so the key set still matches
+    // Chrome exactly. See _markWebIdlOperationsEnumerable in bootstrap.js.
+    #[test]
+    fn webidl_operations_are_enumerable_on_interface_prototypes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const descriptor =
+                  Object.getOwnPropertyDescriptor(MutationObserver.prototype, 'observe');
+                return JSON.stringify({
+                  mutationObserver: Object.keys(MutationObserver.prototype).sort().join(','),
+                  intersectionObserver: Object.keys(IntersectionObserver.prototype).includes('observe'),
+                  resizeObserver: Object.keys(ResizeObserver.prototype).includes('observe'),
+                  performanceObserver: Object.keys(PerformanceObserver.prototype).includes('observe'),
+                  internalsHidden: !Object.keys(MutationObserver.prototype).includes('_notify'),
+                  writable: descriptor.writable,
+                  configurable: descriptor.configurable,
+                });
+                "#,
+            )
+            .unwrap();
+        let seen: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("descriptor json");
+        assert_eq!(seen["mutationObserver"], "disconnect,observe,takeRecords");
+        assert_eq!(seen["intersectionObserver"], true);
+        assert_eq!(seen["resizeObserver"], true);
+        assert_eq!(seen["performanceObserver"], true);
+        assert_eq!(seen["internalsHidden"], true);
+        // Still a method descriptor, not a data property masquerading as one.
+        assert_eq!(seen["writable"], true);
+        assert_eq!(seen["configurable"], true);
+    }
+
+    // Mirrors zone.js patchClass(), which Angular installs for MutationObserver:
+    // it builds a proxy prototype by walking `for (prop in instance)` and
+    // forwarding every function-valued property to the original instance. With
+    // enumerable: false methods that loop found nothing, so the patched class had
+    // no observe() and Angular's router died on "n.observe is not a function"
+    // before rendering anything. #245 was the same disagreement on the
+    // getOwnPropertyDescriptor path.
+    #[test]
+    fn zone_js_style_class_patch_finds_observer_operations() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                var scriptTestSetup = true;
+                const Original = globalThis.MutationObserver;
+                const ORIGINAL_INSTANCE = '__zone_symbol__originalInstance';
+                function Patched(...args) { this[ORIGINAL_INSTANCE] = new Original(...args); }
+                const forwarded = [];
+                const probe = new Original(function () {});
+                for (const prop in probe) {
+                  if (typeof probe[prop] !== 'function') continue;
+                  forwarded.push(prop);
+                  Patched.prototype[prop] = function () {
+                    return this[ORIGINAL_INSTANCE][prop].apply(this[ORIGINAL_INSTANCE], arguments);
+                  };
+                }
+
+                // Drive the patched class the way Angular drives it.
+                const observer = new Patched(() => {});
+                observer.observe(document.body, { childList: true });
+                document.body.appendChild(document.createElement('span'));
+                const taken = observer.takeRecords().length;
+                observer.disconnect();
+                return JSON.stringify({ forwarded: forwarded.sort().join(','), taken });
+                "#,
+            )
+            .unwrap();
+        let patched: serde_json::Value =
+            serde_json::from_str(result.as_str().unwrap()).expect("patch json");
+        for operation in ["observe", "disconnect", "takeRecords"] {
+            assert!(
+                patched["forwarded"]
+                    .as_str()
+                    .expect("forwarded list")
+                    .contains(operation),
+                "zone.js-style for-in patch must discover {operation}, found: {}",
+                patched["forwarded"]
+            );
+        }
+        // And the forwarded observe() actually observes.
+        assert_eq!(patched["taken"], 1);
     }
 
     // Writing goes through the same insertion steps as any other insertion.

@@ -2,6 +2,7 @@ use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) u32);
@@ -248,6 +249,17 @@ pub struct DomTree {
     inner: RefCell<DomTreeInner>,
 }
 
+/// Host-fetched author CSS kept outside the page-visible DOM.
+///
+/// A linked stylesheet may participate in rendering even when the response is
+/// not origin-clean. Keeping those bytes here prevents a synthetic `<style>`
+/// node from exposing them through ordinary DOM APIs.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalStylesheet {
+    pub sources: Vec<Arc<str>>,
+    pub origin_clean: bool,
+}
+
 /// Live control state is separate from content attributes and serialization.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FormControlState {
@@ -262,6 +274,7 @@ pub(crate) struct DomTreeInner {
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
     form_controls: HashMap<NodeId, FormControlState>,
+    external_stylesheets: HashMap<NodeId, ExternalStylesheet>,
     /// Shadow roots are arena nodes with their own child list. They are kept
     /// outside the ordinary parent links so light-tree traversal never crosses
     /// into a shadow tree by accident.
@@ -294,6 +307,7 @@ impl DomTree {
                 document: NodeId(0),
                 id_index: HashMap::new(),
                 form_controls: HashMap::new(),
+                external_stylesheets: HashMap::new(),
                 shadow_roots: HashMap::new(),
                 shadow_roots_by_host: HashMap::new(),
                 allow_declarative_shadow_roots: false,
@@ -304,6 +318,78 @@ impl DomTree {
 
     pub fn document(&self) -> NodeId {
         self.inner.borrow().document
+    }
+
+    pub fn replace_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        inner.external_stylesheets.insert(
+            owner,
+            ExternalStylesheet {
+                sources: vec![Arc::from(source)],
+                origin_clean,
+            },
+        );
+        true
+    }
+
+    pub fn append_external_stylesheet(
+        &self,
+        owner: NodeId,
+        source: String,
+        origin_clean: bool,
+    ) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner
+            .nodes
+            .get(owner.index())
+            .and_then(Option::as_ref)
+            .is_none()
+        {
+            return false;
+        }
+        let sheet = inner
+            .external_stylesheets
+            .entry(owner)
+            .or_insert_with(|| ExternalStylesheet {
+                sources: Vec::new(),
+                origin_clean: true,
+            });
+        sheet.sources.push(Arc::from(source));
+        sheet.origin_clean &= origin_clean;
+        true
+    }
+
+    pub fn remove_external_stylesheet(&self, owner: NodeId) -> bool {
+        self.inner
+            .borrow_mut()
+            .external_stylesheets
+            .remove(&owner)
+            .is_some()
+    }
+
+    pub fn external_stylesheet(&self, owner: NodeId) -> Option<ExternalStylesheet> {
+        self.inner
+            .borrow()
+            .external_stylesheets
+            .get(&owner)
+            .cloned()
+    }
+
+    pub fn external_stylesheets(&self) -> HashMap<NodeId, ExternalStylesheet> {
+        self.inner.borrow().external_stylesheets.clone()
     }
 
     pub fn form_control_state(&self, node: NodeId) -> Option<FormControlState> {

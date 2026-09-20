@@ -55,8 +55,16 @@ const BACKSPACE_JS: &str = "(function() {\
     if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
     var v = t.value || '';\
     var s = t.selectionStart, e = t.selectionEnd;\
+    function backCount(str, p) {\
+        if (p >= 2) {\
+            var low = str.charCodeAt(p - 1), high = str.charCodeAt(p - 2);\
+            if (low >= 0xDC00 && low <= 0xDFFF && high >= 0xD800 && high <= 0xDBFF) return 2;\
+        }\
+        return 1;\
+    }\
     if (s == null) {\
-        globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, -1));\
+        var n = backCount(v, v.length);\
+        globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, v.length - n));\
     } else {\
         s = Math.max(0, Math.min(s, v.length));\
         e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
@@ -65,8 +73,9 @@ const BACKSPACE_JS: &str = "(function() {\
             globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + v.slice(hi));\
             t.setSelectionRange(lo, lo);\
         } else if (s > 0) {\
-            globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, s - 1) + v.slice(s));\
-            t.setSelectionRange(s - 1, s - 1);\
+            var d = backCount(v, s);\
+            globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, s - d) + v.slice(s));\
+            t.setSelectionRange(s - d, s - d);\
         }\
     }\
     t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\

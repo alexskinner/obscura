@@ -937,6 +937,12 @@ fn truncate(text: &str, max_chars: usize) -> String {
 async fn tool_navigate(args: &Value, state: &mut BrowserState) -> Result<String, String> {
     let url = args.get("url").and_then(Value::as_str)
         .ok_or("Missing url parameter")?;
+    if url::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| parsed.scheme() == "file")
+    {
+        return Err("file:// navigation is disabled for MCP".to_string());
+    }
     let wait_until = args.get("waitUntil").and_then(Value::as_str).unwrap_or("load");
 
     let condition = obscura_browser::lifecycle::WaitUntil::from_str(wait_until);
@@ -2116,6 +2122,15 @@ mod tests {
         assert!(tools.iter().all(|tool| {
             tool["name"] != "browser_screenshot" && tool["name"] != "browser_pdf"
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_navigation_rejects_local_files() {
+        let mut state = BrowserState::new(None, None, false);
+        let error = tool_navigate(&json!({"url": "file:///etc/passwd"}), &mut state)
+            .await
+            .expect_err("MCP must not expose local files");
+        assert!(error.contains("file:// navigation is disabled"));
     }
 
     #[cfg(feature = "render")]

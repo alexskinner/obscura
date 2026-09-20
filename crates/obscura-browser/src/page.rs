@@ -164,31 +164,6 @@ fn navigation_referrer(source: &Url, target: &Url) -> String {
     origin
 }
 
-/// Escape a value for safe inclusion inside a JavaScript template
-/// literal. The previous implementation only escaped `\`, `` ` `` and
-/// `${`; that left U+2028 / U+2029 (the JS-specific line terminators)
-/// and other control characters as breakout vectors. Done at the
-/// callsite means future tweaks come back to one function.
-fn escape_for_js_template_literal(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '`' => out.push_str("\\`"),
-            '$' => out.push_str("\\$"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            '\u{0000}' => out.push_str("\\0"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
     pub request_id: String,
@@ -446,6 +421,33 @@ fn materialize_stylesheet_graph(
     output.push_str(&rebase_css_urls(&sheet.rules, &sheet.response_url));
     active.remove(actual_key);
     Some(output)
+}
+
+fn stylesheet_graph_is_origin_clean(
+    key: &str,
+    sheets: &std::collections::HashMap<String, LoadedStylesheet>,
+    aliases: &std::collections::HashMap<String, String>,
+    active: &mut std::collections::HashSet<String>,
+    document_url: &Url,
+) -> bool {
+    let actual_key = aliases.get(key).map(String::as_str).unwrap_or(key);
+    if !active.insert(actual_key.to_string()) {
+        return true;
+    }
+    let Some(sheet) = sheets.get(actual_key) else {
+        active.remove(actual_key);
+        return true;
+    };
+    let clean = sheet.response_url.origin() == document_url.origin()
+        && sheet.imports.iter().all(|import| {
+            let Ok(import_url) = sheet.response_url.join(&import.url) else {
+                return true;
+            };
+            let (import_key, _) = canonical_stylesheet_url(import_url);
+            stylesheet_graph_is_origin_clean(&import_key, sheets, aliases, active, document_url)
+        });
+    active.remove(actual_key);
+    clean
 }
 
 /// Preserve the URL base of a fetched stylesheet after it is materialized as
@@ -963,88 +965,32 @@ fn parse_import_url(stmt: &str) -> Option<StylesheetImport> {
     })
 }
 
-/// Materialize a fetched linked sheet immediately after its source `<link>`.
-///
-/// Keeping each sheet at its document position matters when linked and inline
-/// author sheets are interleaved. Appending one aggregate `<style>` to `<head>`
-/// makes every external rule later than every inline rule, which changes the
-/// CSS cascade even when the external fetches themselves complete in order.
-/// The synthetic style retains the link's effective media query so the same
-/// fetched bytes can enter print layout without leaking into screen layout.
-fn materialize_linked_stylesheet_script(link_index: usize, css: &str) -> String {
-    let escaped_css = escape_for_js_template_literal(css);
+/// Attach CSSOM state and dispatch load for a host-fetched linked sheet.
+/// Fetched bytes live in native DOM state, never in a synthetic `<style>` that
+/// page script could read.
+fn register_linked_stylesheet_script(link_index: usize, response_url: &str) -> String {
+    let response_url = serde_json::to_string(response_url).unwrap_or_else(|_| "null".to_string());
     format!(
         r#"(function() {{
             var links = document.querySelectorAll('link[rel~="stylesheet"]');
             var link = links[{link_index}];
-            if (!link || !link.parentNode) return;
-            var style = null;
-            function effectiveMedia() {{
-                // Until the generic Element shim reflects HTMLLinkElement.media,
-                // `this.media = "all"` creates an own property while the parsed
-                // media="print" attribute remains unchanged.
-                if (Object.prototype.hasOwnProperty.call(link, 'media')) {{
-                    return String(link.media || '');
-                }}
-                return link.getAttribute('media') || '';
-            }}
+            if (!link) return;
             function syncSheet() {{
-                if (!style) {{
-                    style = document.createElement('style');
-                    style.setAttribute('data-obscura-external-stylesheets', '');
-                    style.textContent = `{escaped_css}`;
-                    globalThis.__obscura_registerLinkedStylesheet(link, style);
+                if (Object.prototype.hasOwnProperty.call(link, 'media')) {{
+                    var media = String(link.media || '');
+                    if (media) link.setAttribute('media', media);
+                    else link.removeAttribute('media');
                 }}
-                var enabled = link.parentNode
-                    && !link.disabled
-                    && !link.hasAttribute('disabled');
-                if (!enabled) {{
-                    if (style && style.parentNode) style.parentNode.removeChild(style);
-                    return;
-                }}
-                var media = effectiveMedia().trim();
-                if (media) style.setAttribute('media', media);
-                else style.removeAttribute('media');
-                if (!style.parentNode) {{
-                    link.parentNode.insertBefore(style, link.nextSibling);
+                if (Object.prototype.hasOwnProperty.call(link, 'disabled')) {{
+                    if (link.disabled) link.setAttribute('disabled', '');
+                    else link.removeAttribute('disabled');
                 }}
             }}
 
-            // A non-matching sheet still loads and fires its event. Its handler
-            // may then make the sheet applicable (the common
-            // media=print/onload="this.media='all'" async-CSS pattern).
             syncSheet();
+            globalThis.__obscura_registerLinkedStylesheet(link, {response_url});
             try {{ link.dispatchEvent(new Event('load')); }}
             finally {{ syncSheet(); }}
-        }})()"#
-    )
-}
-
-/// Materialize one fetched `@import` immediately before its source inline
-/// `<style>`. Imported rules precede the importing sheet in the author cascade,
-/// and inherit the source sheet's own media condition in addition to the
-/// import rule's media wrapper.
-fn materialize_inline_import_script(style_index: usize, css: &str) -> String {
-    let escaped_css = escape_for_js_template_literal(css);
-    format!(
-        r#"(function() {{
-            var styles = document.querySelectorAll('style');
-            var source = null;
-            var authorIndex = -1;
-            for (var i = 0; i < styles.length; i++) {{
-                var candidate = styles[i];
-                if (candidate.hasAttribute('data-obscura-external-stylesheets')
-                    || candidate.hasAttribute('data-obscura-inline-import')) continue;
-                authorIndex++;
-                if (authorIndex === {style_index}) {{ source = candidate; break; }}
-            }}
-            if (!source || !source.parentNode) return;
-            var imported = document.createElement('style');
-            imported.setAttribute('data-obscura-inline-import', '');
-            var media = source.getAttribute('media') || '';
-            if (media.trim()) imported.setAttribute('media', media);
-            imported.textContent = `{escaped_css}`;
-            source.parentNode.insertBefore(imported, source);
         }})()"#
     )
 }
@@ -1074,22 +1020,13 @@ fn linked_stylesheet_requests(dom: &DomTree) -> Vec<(usize, String)> {
     links
 }
 
-/// Discover fetchable `@import` rules in inline author sheets. The source
-/// index excludes Obscura's own materialized sheets so it remains stable while
-/// imports are inserted before their source nodes.
+/// Discover fetchable `@import` rules in inline author sheets.
 fn inline_stylesheet_import_requests(dom: &DomTree) -> Vec<(usize, StylesheetImport)> {
     let style_ids = dom.query_selector_all("style").unwrap_or_default();
     let mut imports = Vec::new();
     let mut author_index = 0usize;
     for style_id in style_ids {
-        let Some(node) = dom.get_node(style_id) else {
-            continue;
-        };
-        if node
-            .get_attribute("data-obscura-external-stylesheets")
-            .is_some()
-            || node.get_attribute("data-obscura-inline-import").is_some()
-        {
+        if dom.get_node(style_id).is_none() {
             continue;
         }
         let (style_imports, _) = split_css_imports(&dom.text_content(style_id));
@@ -1900,7 +1837,7 @@ impl Page {
         }
     }
 
-    async fn fetch_stylesheets(&mut self) -> Vec<(AuthorStylesheetTarget, String)> {
+    async fn fetch_stylesheets(&mut self) -> Vec<(AuthorStylesheetTarget, String, bool, String)> {
         let (all_links, inline_imports) = match &self.js {
             Some(js) => js
                 .with_dom(|dom| {
@@ -2104,6 +2041,15 @@ impl Page {
         roots
             .into_iter()
             .filter_map(|(target, key, media)| {
+                let actual_key = aliases.get(&key).map(String::as_str).unwrap_or(&key);
+                let response_url = sheets.get(actual_key)?.response_url.to_string();
+                let origin_clean = stylesheet_graph_is_origin_clean(
+                    &key,
+                    &sheets,
+                    &aliases,
+                    &mut std::collections::HashSet::new(),
+                    &document_url,
+                );
                 materialize_stylesheet_graph(
                     &key,
                     &sheets,
@@ -2115,7 +2061,7 @@ impl Page {
                         Some(media) => format!("@media {media} {{\n{css}\n}}\n"),
                         None => css,
                     };
-                    (target, css)
+                    (target, css, origin_clean, response_url)
                 })
             })
             .collect()
@@ -2125,16 +2071,16 @@ impl Page {
         self.execute_scripts_with_module_budget(None).await;
     }
 
-    /// Drive only dynamic script elements which participate in the current
-    /// document's load-event delay set. Browser script runners keep this set
-    /// separate from arbitrary post-load imports, timers, and enhancement
-    /// scripts; navigation readiness must not turn those into an implicit
-    /// multi-second settle.
-    async fn drive_load_delaying_scripts(
+    /// Drive a selected script queue until it empties or the shared parser
+    /// deadline expires. The caller chooses the queue so parser blockers and
+    /// load-delaying dynamic scripts keep their distinct lifecycle semantics.
+    async fn drive_pending_scripts(
         js: &mut ObscuraJsRuntime,
         deadline: tokio::time::Instant,
+        pending: fn(&mut ObscuraJsRuntime) -> bool,
+        label: &str,
     ) -> bool {
-        while js.has_pending_load_delaying_scripts() {
+        while pending(js) {
             let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
             else {
                 return false;
@@ -2150,13 +2096,13 @@ impl Page {
             .await
             {
                 Ok(Ok(_idle)) => {
-                    if js.has_pending_load_delaying_scripts() {
+                    if pending(js) {
                         tokio::task::yield_now().await;
                     }
                 }
                 Ok(Err(error)) => {
                     if obscura_js::runtime::is_fatal_event_loop_error(&error) {
-                        tracing::warn!("load-delaying dynamic script event loop failed: {error}");
+                        tracing::warn!("{label} script event loop failed: {error}");
                         return false;
                     }
                     // A load-delaying script threw or left an unhandled
@@ -2164,7 +2110,7 @@ impl Page {
                     // killing the pump would strand every still-pending script
                     // (#699). The absolute deadline above bounds a page that
                     // errors on every turn.
-                    tracing::warn!("load-delaying script task error, continuing: {error}");
+                    tracing::warn!("{label} script task error, continuing: {error}");
                     tokio::task::yield_now().await;
                 }
                 Err(_) => {
@@ -2174,6 +2120,32 @@ impl Page {
             }
         }
         true
+    }
+
+    async fn drive_load_delaying_scripts(
+        js: &mut ObscuraJsRuntime,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        Self::drive_pending_scripts(
+            js,
+            deadline,
+            ObscuraJsRuntime::has_pending_load_delaying_scripts,
+            "load-delaying",
+        )
+        .await
+    }
+
+    async fn drive_parser_blocking_scripts(
+        js: &mut ObscuraJsRuntime,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        Self::drive_pending_scripts(
+            js,
+            deadline,
+            ObscuraJsRuntime::has_pending_parser_blocking_scripts,
+            "parser-blocking",
+        )
+        .await
     }
 
     async fn execute_scripts_with_module_budget(&mut self, module_budget_override: Option<u64>) {
@@ -2668,6 +2640,15 @@ impl Page {
                     } else {
                         let fetched_script = fetched.remove(&index);
                         execute_classic(self, script, fetched_script);
+                        if let Some(js) = &mut self.js {
+                            if js.take_document_write_inserted_script()
+                                && !Self::drive_parser_blocking_scripts(js, script_deadline).await
+                            {
+                                tracing::warn!(
+                                    "script deadline reached with a parser-blocking document.write script pending"
+                                );
+                            }
+                        }
                     }
                 }
                 ScriptKind::Module => {
@@ -2840,6 +2821,15 @@ impl Page {
                     let script = &all_scripts[index];
                     let fetched_script = fetched.remove(&index);
                     execute_classic(self, script, fetched_script);
+                    if let Some(js) = &mut self.js {
+                        if js.take_document_write_inserted_script()
+                            && !Self::drive_parser_blocking_scripts(js, script_deadline).await
+                        {
+                            tracing::warn!(
+                                "script deadline reached with a parser-blocking document.write script pending"
+                            );
+                        }
+                    }
                 }
                 ScheduledScript::Module {
                     prepared,
@@ -3393,37 +3383,43 @@ impl Page {
         self.init_js();
         let author_stylesheets = self.fetch_stylesheets().await;
 
-        // Inject CSS as a global so getComputedStyle and any CSS-aware shim
-        // can read it. Has to happen before scripts run, regardless of
-        // waitUntil, so handlers that read window.__obscura_css see it.
+        // Install fetched CSS in native DOM state. Cross-origin bytes must not
+        // become observable through a synthetic style element or page global.
         if !author_stylesheets.is_empty() {
             if let Some(js) = &mut self.js {
-                let combined_css = author_stylesheets
-                    .iter()
-                    .map(|(_, css)| css.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                // Use the thorough template-literal escape that
-                // covers U+2028 / U+2029 and other control chars.
-                // The previous escaper only handled `, \, and ${,
-                // letting attacker-controlled CSS containing a raw
-                // U+2028 break out of the template literal and run
-                // arbitrary JS in the page's V8 realm.
-                let escaped = escape_for_js_template_literal(&combined_css);
-                let code = format!("globalThis.__obscura_css = `{}`;", escaped);
-                let _ = js.execute_script("<css>", &code);
-                for (target, css) in &author_stylesheets {
-                    let code = match target {
-                        AuthorStylesheetTarget::Linked(link_index) => {
-                            materialize_linked_stylesheet_script(*link_index, css)
+                js.with_dom(|dom| {
+                    let links = dom
+                        .query_selector_all("link[rel~=\"stylesheet\"]")
+                        .unwrap_or_default();
+                    let styles = dom.query_selector_all("style").unwrap_or_default();
+                    for (target, css, origin_clean, _) in &author_stylesheets {
+                        let owner = match target {
+                            AuthorStylesheetTarget::Linked(index) => links.get(*index),
+                            AuthorStylesheetTarget::InlineImport(index) => styles.get(*index),
+                        };
+                        if let Some(owner) = owner {
+                            dom.append_external_stylesheet(*owner, css.clone(), *origin_clean);
                         }
-                        AuthorStylesheetTarget::InlineImport(style_index) => {
-                            materialize_inline_import_script(*style_index, css)
-                        }
-                    };
-                    let _ = js.execute_script("<fetch_stylesheets>", &code);
+                    }
+                });
+                for (target, _, _, response_url) in &author_stylesheets {
+                    if let AuthorStylesheetTarget::Linked(link_index) = target {
+                        let _ = js.execute_script(
+                            "<fetch_stylesheets>",
+                            &register_linked_stylesheet_script(*link_index, response_url),
+                        );
+                    }
                 }
             }
+        }
+        // Static registration is complete before page script runs. Remove the
+        // temporary host bridge even when the document had no initial sheets;
+        // dynamic loads use the closure-private function directly.
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script(
+                "<fetch_stylesheets-cleanup>",
+                "delete globalThis.__obscura_registerLinkedStylesheet",
+            );
         }
         self.document_timeline_origin = std::time::Instant::now();
         #[cfg(feature = "render")]
@@ -3691,6 +3687,9 @@ impl Page {
                         }
                     }
                 }
+                for sheet in dom.external_stylesheets().values() {
+                    sources.extend(sheet.sources.iter().map(ToString::to_string));
+                }
                 sources
             })
             .unwrap_or_default();
@@ -3884,7 +3883,9 @@ impl Page {
 
     /// Rasterize the current DOM to PNG bytes at `viewport` (CSS pixels), when
     /// the render feature is compiled in. None if the page has no DOM or the
-    /// viewport is zero-sized.
+    /// viewport is zero-sized. Never loads resources synchronously; without a
+    /// runtime, external assets remain unavailable until the page is resumed
+    /// and its resources are prepared.
     #[cfg(feature = "render")]
     pub fn screenshot(&self, viewport: (f32, f32)) -> Option<Vec<u8>> {
         self.screenshot_with_animation_sample(viewport, self.live_animation_sample())
@@ -3953,14 +3954,19 @@ impl Page {
                 return Some(png);
             }
         }
+        // A DOM-only page still owns network policy. Its fallback must not
+        // bypass the page transport through the standalone synchronous loader.
         self.with_dom(|dom| {
-            obscura_js::screenshot_png_scrolled_at_animation_time_with_surface_color(
+            let mut resources = obscura_js::RenderResourceCache::default();
+            resources.set_sync_loading_enabled(false);
+            obscura_js::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
                 dom,
                 viewport,
                 base_url,
                 scroll,
                 animation_sample.time,
                 self.capture_surface_color(),
+                &mut resources,
             )
         })
             .flatten()
@@ -4754,17 +4760,40 @@ impl Drop for Page {
 #[cfg(test)]
 mod tests {
     use super::{
-        css_resource_urls, linked_stylesheet_requests, materialize_linked_stylesheet_script,
-        materialize_stylesheet_graph, navigation_chain_limit_from_env_value, navigation_referrer,
+        css_resource_urls, linked_stylesheet_requests, materialize_stylesheet_graph,
+        navigation_chain_limit_from_env_value, navigation_referrer,
         navigation_timeout_from_env_value, parse_import_url, rebase_css_urls,
-        script_response_is_executable, split_css_imports, truncate_on_char_boundary,
-        url_matches_cdp_pattern, LoadedStylesheet, PendingFrameWork, StylesheetImport,
-        DEFAULT_NAVIGATION_CHAIN_LIMIT,
+        register_linked_stylesheet_script, script_response_is_executable, split_css_imports,
+        stylesheet_graph_is_origin_clean, truncate_on_char_boundary, url_matches_cdp_pattern,
+        LoadedStylesheet, PendingFrameWork, StylesheetImport, DEFAULT_NAVIGATION_CHAIN_LIMIT,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    fn install_linked_stylesheet(
+        runtime: &mut obscura_js::runtime::ObscuraJsRuntime,
+        index: usize,
+        css: &str,
+        origin_clean: bool,
+        response_url: &str,
+    ) {
+        runtime
+            .with_dom(|dom| {
+                let links = dom
+                    .query_selector_all(r#"link[rel~="stylesheet"]"#)
+                    .expect("valid selector");
+                dom.replace_external_stylesheet(links[index], css.to_string(), origin_clean)
+            })
+            .expect("live DOM");
+        runtime
+            .execute_script(
+                "<linked-sheet>",
+                &register_linked_stylesheet_script(index, response_url),
+            )
+            .expect("register linked sheet");
+    }
 
     #[test]
     fn navigation_timeout_environment_default_remains_thirty_seconds() {
@@ -5330,10 +5359,18 @@ mod tests {
             .as_ref()
             .unwrap()
             .with_dom(|dom| {
-                dom.query_selector_all("style[data-obscura-external-stylesheets]")
+                dom.query_selector_all(r#"link[rel~="stylesheet"]"#)
                     .unwrap()
                     .into_iter()
-                    .map(|nid| dom.text_content(nid))
+                    .map(|nid| {
+                        dom.external_stylesheet(nid)
+                            .expect("loaded linked sheet")
+                            .sources
+                            .iter()
+                            .map(|source| source.as_ref())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap();
@@ -5423,24 +5460,32 @@ mod tests {
                     .unwrap()
                     .into_iter()
                     .map(|nid| {
-                        let node = dom.get_node(nid).unwrap();
                         (
-                            node.get_attribute("data-obscura-inline-import").is_some(),
-                            node.get_attribute("media").map(str::to_string),
+                            dom.external_stylesheet(nid)
+                                .map(|sheet| {
+                                    sheet
+                                        .sources
+                                        .iter()
+                                        .map(|source| source.as_ref())
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_default(),
                             dom.text_content(nid),
                         )
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap();
-        assert_eq!(styles.len(), 3);
-        assert!(styles[0].0 && styles[0].2.contains(".imported-a"));
-        assert!(styles[1].0 && styles[1].2.contains(".imported-b"));
-        assert!(!styles[2].0 && styles[2].2.contains(".local"));
-        assert_eq!(styles[0].1.as_deref(), Some("screen, print"));
-        assert_eq!(styles[1].1.as_deref(), Some("screen, print"));
-        assert!(styles[0].2.starts_with("@media print {\n"));
-        assert!(styles[1].2.starts_with("@media print {\n"));
+        assert_eq!(
+            styles.len(),
+            1,
+            "imports must not create observable style nodes"
+        );
+        assert!(styles[0].0.contains(".imported-a"));
+        assert!(styles[0].0.contains(".imported-b"));
+        assert!(styles[0].0.starts_with("@media print {\n"));
+        assert!(styles[0].1.contains(".local"));
 
         #[cfg(feature = "render")]
         {
@@ -5598,6 +5643,49 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         (format!("http://{address}"), request_rx)
+    }
+
+    fn spawn_written_script_order_server() -> String {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let vendor_finished = std::sync::Arc::new(AtomicBool::new(false));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let vendor_finished = vendor_finished.clone();
+                std::thread::spawn(move || {
+                    let mut request = [0u8; 2048];
+                    let length = stream.read(&mut request).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&request[..length]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let body = if path == "/vendor.js" {
+                        std::thread::sleep(std::time::Duration::from_millis(125));
+                        vendor_finished.store(true, Ordering::SeqCst);
+                        "globalThis.__vendorValue = 1;".to_string()
+                    } else {
+                        format!(
+                            "globalThis.__appRequestFollowedVendor = {}; globalThis.__appSawVendor = globalThis.__vendorValue;",
+                            vendor_finished.load(Ordering::SeqCst),
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                });
+            }
+        });
+        format!("http://{address}")
     }
 
     fn spawn_script_resource_cache_server(
@@ -6866,6 +6954,77 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn document_write_external_script_blocks_later_parser_scripts() {
+        let (base, requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(75),
+            "globalThis.__writtenOrder.push('external'); globalThis.__writtenValue = 1;",
+        );
+        let html = format!(
+            r#"<html><body>
+                <script>globalThis.__writtenOrder = [];</script>
+                <script>
+                    document.write('<script src="{base}/written.js"><\/script>');
+                    document.write('<script>globalThis.__writtenOrder.push("written:" + String(globalThis.__writtenValue));<\/script>');
+                </script>
+                <script>globalThis.__writtenOrder.push('after:' + String(globalThis.__writtenValue));</script>
+            </body></html>"#,
+        );
+        let mut page = import_map_test_page(
+            "document-write-parser-blocking",
+            "http://127.0.0.1:9",
+            &html,
+        );
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "/written.js",
+        );
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("globalThis.__writtenOrder")
+                .unwrap(),
+            serde_json::json!(["external", "written:1", "after:1"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_write_does_not_start_later_async_script_before_blocker() {
+        let base = spawn_written_script_order_server();
+        let html = format!(
+            r#"<html><body><script>
+                document.write('<script src="{base}/vendor.js"><\/script>');
+                document.write('<script async src="{base}/app.js"><\/script>');
+            </script><script>
+                globalThis.__afterWriteSawVendor = globalThis.__vendorValue;
+            </script></body></html>"#,
+        );
+        let mut page = import_map_test_page(
+            "document-write-async-after-blocker",
+            "http://127.0.0.1:9",
+            &html,
+        );
+
+        page.execute_scripts().await;
+
+        assert_eq!(
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate(
+                    "[globalThis.__afterWriteSawVendor, globalThis.__appSawVendor, globalThis.__appRequestFollowedVendor]"
+                )
+                .unwrap(),
+            serde_json::json!([1, 1, true]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn load_delaying_script_progresses_through_continuously_ready_timer_work() {
         let (base, requests) = spawn_delayed_classic_script_server(
             std::time::Duration::from_millis(75),
@@ -7639,38 +7798,86 @@ mod tests {
     }
 
     #[cfg(feature = "render")]
-    #[tokio::test(flavor = "current_thread")]
-    async fn blocked_render_resources_are_never_fetched_by_layout_or_transport() {
-        let (address, seen_rx) = spawn_delayed_svg_server(0, 4);
+    async fn assert_render_resource_blocklist(warmup: bool) {
+        let (address, seen_rx) = spawn_delayed_svg_server(0, 5);
         let page_url = format!("http://{address}/page");
-        let asset_url = format!("http://{address}/blocked.svg");
-        let mut page = page_with_transport_and_image("blocked", &page_url, &asset_url);
-        page.set_blocked_urls(vec!["*blocked.svg".to_string()]);
+        let mut page = page_with_transport_and_body(
+            "blocked",
+            &page_url,
+            &format!(r#"
+                <img id="allowed" src="http://{address}/allowed.svg">
+                <img src="http://{address}/blocked.svg">
+                <div style="width:20px;height:20px;background-image:url(http://{address}/blocked-css.svg)"></div>
+            "#),
+        );
+        page.set_blocked_urls(vec!["*blocked*".to_string()]);
 
-        let started = std::time::Instant::now();
-        page.js
-            .as_mut()
-            .unwrap()
-            .evaluate("document.getElementById('i').getBoundingClientRect().width")
-            .unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_millis(600));
+        // Each caller gets a fresh page: a prior miss cached by the other
+        // path would hide a missing blocklist check here.
+        if warmup {
+            assert_eq!(page.prepare_screenshot_resources(2_000).await, 1);
+        } else {
+            page.screenshot(page.viewport).expect("cache-only capture");
+            page.queue_pending_render_resources();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while page.has_pending_render_resources() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    page.drain_render_resource_results();
+                }
+            })
+            .await
+            .expect("renderer loads must finish");
+        }
         assert_eq!(
-            page.queue_pending_render_resources(),
-            0,
-            "a blocked URL must not start a transport request"
+            page.js
+                .as_mut()
+                .unwrap()
+                .evaluate("document.getElementById('allowed').naturalWidth")
+                .unwrap()
+                .as_f64(),
+            Some(20.0),
+            "the allowed image must actually load"
         );
-        assert!(
-            page.js.as_ref().unwrap().render_image_resource_is_known(
-                &asset_url,
-                obscura_js::ImageRequestProfile::NoCorsInclude
-            ),
-            "a blocked URL is remembered as missing so layout stops asking"
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let requests: Vec<_> = seen_rx.try_iter().collect();
+        assert_eq!(
+            requests.len(), 1,
+            "only the allowed image may reach the server: {requests:?}"
         );
-        assert_eq!(page.prepare_screenshot_resources(200).await, 0);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(requests[0].starts_with("GET /allowed.svg "), "{requests:?}");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn screenshot_warmup_honours_blocked_urls_on_a_fresh_page() {
+        assert_render_resource_blocklist(true).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn renderer_misses_honour_blocked_urls_on_a_fresh_page() {
+        assert_render_resource_blocklist(false).await;
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn suspended_page_screenshot_never_opens_resource_requests() {
+        let (address, seen_rx) = spawn_delayed_svg_server(0, 5);
+        let mut page = page_with_transport_and_image(
+            "suspended-capture",
+            &format!("http://{address}/page"),
+            &format!("http://{address}/blocked.svg"),
+        );
+        page.set_blocked_urls(vec!["*blocked.svg".to_string()]);
+        page.suspend_js();
+        assert!(page.js.is_none());
+        let png = page.screenshot(page.viewport).expect("DOM-only capture");
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(
-            seen_rx.try_recv().is_err(),
-            "Network.setBlockedURLs must also stop renderer-initiated loads"
+            seen_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "a suspended page must not use the synchronous renderer HTTP loader"
         );
     }
 
@@ -8591,6 +8798,46 @@ mod tests {
     }
 
     #[test]
+    fn cross_origin_import_taints_the_materialized_stylesheet_cssom() {
+        let document_url = url::Url::parse("https://example.test/page").unwrap();
+        let root_url = url::Url::parse("https://example.test/root.css").unwrap();
+        let imported_url = url::Url::parse("https://cdn.test/imported.css").unwrap();
+        let sheets = std::collections::HashMap::from([
+            (
+                root_url.to_string(),
+                LoadedStylesheet {
+                    response_url: root_url.clone(),
+                    imports: vec![StylesheetImport {
+                        url: imported_url.to_string(),
+                        media: None,
+                    }],
+                    rules: String::new(),
+                },
+            ),
+            (
+                imported_url.to_string(),
+                LoadedStylesheet {
+                    response_url: imported_url.clone(),
+                    imports: Vec::new(),
+                    rules: ".secret{}".to_string(),
+                },
+            ),
+        ]);
+        let aliases = std::collections::HashMap::from([
+            (root_url.to_string(), root_url.to_string()),
+            (imported_url.to_string(), imported_url.to_string()),
+        ]);
+
+        assert!(!stylesheet_graph_is_origin_clean(
+            root_url.as_str(),
+            &sheets,
+            &aliases,
+            &mut std::collections::HashSet::new(),
+            &document_url,
+        ));
+    }
+
+    #[test]
     fn stylesheet_asset_urls_keep_the_importing_sheets_base() {
         let base = url::Url::parse("https://example.com/css/theme/app.css").unwrap();
         let css = r#"
@@ -8660,12 +8907,13 @@ mod tests {
         let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
         runtime.set_dom(dom);
         runtime.run_page_init();
-        runtime
-            .execute_script(
-                "<async-sheet>",
-                &materialize_linked_stylesheet_script(0, ".target{color:red}"),
-            )
-            .expect("load and materialize async linked sheet");
+        install_linked_stylesheet(
+            &mut runtime,
+            0,
+            ".target{color:red}",
+            true,
+            "https://example.com/style.css",
+        );
 
         let state = runtime
             .with_dom(|dom| {
@@ -8673,13 +8921,11 @@ mod tests {
                     .query_selector("#async")
                     .expect("valid selector")
                     .expect("async link");
-                let styles = dom
-                    .query_selector_all("style[data-obscura-external-stylesheets]")
-                    .expect("valid selector");
                 (
                     dom.get_node(link)
                         .and_then(|node| node.get_attribute("data-loaded").map(str::to_owned)),
-                    styles.first().map(|&nid| dom.text_content(nid)),
+                    dom.external_stylesheet(link)
+                        .and_then(|sheet| sheet.sources.first().map(ToString::to_string)),
                 )
             })
             .expect("live DOM");
@@ -8707,12 +8953,13 @@ mod tests {
         let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
         runtime.set_dom(dom);
         runtime.run_page_init();
-        runtime
-            .execute_script(
-                "<print-sheet>",
-                &materialize_linked_stylesheet_script(0, "body{display:none}"),
-            )
-            .expect("finish print linked sheet load");
+        install_linked_stylesheet(
+            &mut runtime,
+            0,
+            "body{display:none}",
+            true,
+            "https://example.com/style.css",
+        );
 
         let state = runtime
             .with_dom(|dom| {
@@ -8723,12 +8970,8 @@ mod tests {
                 (
                     dom.get_node(link)
                         .and_then(|node| node.get_attribute("data-loaded").map(str::to_owned)),
-                    dom.query_selector("style[data-obscura-external-stylesheets]")
-                        .expect("valid selector")
-                        .and_then(|style| {
-                            dom.get_node(style)
-                                .and_then(|node| node.get_attribute("media").map(str::to_owned))
-                        }),
+                    dom.get_node(link)
+                        .and_then(|node| node.get_attribute("media").map(str::to_owned)),
                 )
             })
             .expect("live DOM");
@@ -8758,21 +9001,20 @@ mod tests {
         runtime.set_dom(dom);
         runtime.set_url("https://example.test/products/widget");
         runtime.run_page_init();
-        runtime
-            .execute_script(
-                "<same-origin-sheet>",
-                &materialize_linked_stylesheet_script(
-                    0,
-                    ".app { color: red } .wide { width: 20px }",
-                ),
-            )
-            .expect("materialize same-origin linked sheet");
-        runtime
-            .execute_script(
-                "<cross-origin-sheet>",
-                &materialize_linked_stylesheet_script(1, ".secret { color: purple }"),
-            )
-            .expect("materialize cross-origin linked sheet");
+        install_linked_stylesheet(
+            &mut runtime,
+            0,
+            ".app { color: red } .wide { width: 20px }",
+            true,
+            "https://example.test/assets/app.css",
+        );
+        install_linked_stylesheet(
+            &mut runtime,
+            1,
+            ".secret { color: purple }",
+            false,
+            "https://cdn.example.test/theme.css",
+        );
 
         let result = runtime
             .evaluate(
@@ -8785,6 +9027,10 @@ mod tests {
                     const sameSheet = same.sheet;
                     const sameRules = sameSheet.cssRules;
                     const crossSheet = cross.sheet;
+                    // Public-looking implementation fields must not be able to
+                    // bypass the closure-private origin decision.
+                    crossSheet._originClean = true;
+                    crossSheet._sourceText = '.forged { color: red }';
                     const security = [];
                     for (const operation of [
                         () => crossSheet.cssRules,
@@ -8797,9 +9043,6 @@ mod tests {
                         catch (error) { security.push(error && error.name); }
                     }
                     sameSheet.insertRule('.added { height: 9px }', sameRules.length);
-                    const source = document.querySelector(
-                        'style[data-obscura-external-stylesheets]'
-                    );
                     return {
                         stableList: list === document.styleSheets,
                         length: list.length,
@@ -8811,11 +9054,11 @@ mod tests {
                         title: sameSheet.title,
                         rulesIdentity: sameSheet.cssRules === sameRules,
                         rules: Array.from(sameRules, rule => rule.selectorText),
-                        sourceUpdated: source.textContent.includes('.added'),
+                        bridgeTextHidden: !document.documentElement.textContent.includes('.secret')
+                            && !document.querySelector('style[data-obscura-external-stylesheets]'),
                         crossOwner: crossSheet.ownerNode === cross,
                         crossHref: crossSheet.href,
-                        bridgeSheetsHidden: same.nextSibling.sheet === null
-                            && cross.nextSibling.sheet === null,
+                        privateRulesHidden: crossSheet._rules.length === 0,
                         security,
                     };
                 })()
@@ -8835,10 +9078,10 @@ mod tests {
                 "title": "app",
                 "rulesIdentity": true,
                 "rules": [".app", ".wide", ".added"],
-                "sourceUpdated": true,
+                "bridgeTextHidden": true,
                 "crossOwner": true,
                 "crossHref": "https://cdn.example.test/theme.css",
-                "bridgeSheetsHidden": true,
+                "privateRulesHidden": true,
                 "security": ["SecurityError", "SecurityError", "SecurityError",
                              "SecurityError", "SecurityError"],
             })
@@ -8857,25 +9100,38 @@ mod tests {
         let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
         runtime.set_dom(dom);
         runtime.run_page_init();
-        runtime
-            .execute_script(
-                "<first-sheet>",
-                &materialize_linked_stylesheet_script(0, ".target{height:10px}"),
-            )
-            .expect("materialize first linked sheet");
-        runtime
-            .execute_script(
-                "<second-sheet>",
-                &materialize_linked_stylesheet_script(1, ".target{height:30px}"),
-            )
-            .expect("materialize second linked sheet");
+        install_linked_stylesheet(
+            &mut runtime,
+            0,
+            ".target{height:10px}",
+            true,
+            "https://example.com/first.css",
+        );
+        install_linked_stylesheet(
+            &mut runtime,
+            1,
+            ".target{height:30px}",
+            true,
+            "https://example.com/second.css",
+        );
 
         let sheet_text = runtime
             .with_dom(|dom| {
-                dom.query_selector_all("style")
-                    .expect("valid selector")
+                dom.descendants(dom.document())
                     .into_iter()
-                    .map(|nid| dom.text_content(nid))
+                    .flat_map(|nid| {
+                        let mut sources: Vec<String> = dom
+                            .external_stylesheet(nid)
+                            .map(|sheet| sheet.sources.iter().map(ToString::to_string).collect())
+                            .unwrap_or_default();
+                        if dom.get_node(nid).is_some_and(|node| {
+                            node.as_element()
+                                .is_some_and(|element| element.local.as_ref() == "style")
+                        }) {
+                            sources.push(dom.text_content(nid));
+                        }
+                        sources
+                    })
                     .collect::<Vec<_>>()
             })
             .expect("live DOM");
