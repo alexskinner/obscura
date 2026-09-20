@@ -8700,9 +8700,9 @@ globalThis.getComputedStyle = (el) => {
     }
     if (snapshot.one.has(kebab)) return snapshot.one.get(kebab);
     let value;
-    if (typeof Deno.core.ops.op_computed_style_property === 'function' && el?._nid != null) {
+    if (typeof __obscuraCore.ops.op_computed_style_property === 'function' && el?._nid != null) {
       try {
-        const raw = Deno.core.ops.op_computed_style_property(String(el._nid | 0), kebab);
+        const raw = __obscuraCore.ops.op_computed_style_property(String(el._nid | 0), kebab);
         value = raw == null ? undefined : raw;
       } catch (e) { value = undefined; }
     }
